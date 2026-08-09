@@ -1,0 +1,37 @@
+{
+  // 실습 헬퍼 함수의 '정의로 이동'(Ctrl+클릭)을 위한 설정.
+  //
+  // 노트북은 실행 시점에 sys.path.insert 로 헬퍼 위치를 추가하는데, Pylance 는 코드를
+  // 실행하지 않고 정적으로만 분석하므로 그 경로를 알 수 없다. 같은 위치를 알려 주면
+  // `from _practice1_helper import *` 가 해석되어 정의로 이동과 호버가 동작한다.
+  //
+  // 저장소 루트(".")도 넣는다 — nuplan devkit 과 src 가 in-tree 라 루트 기준으로 import 된다.
+  //
+  // ⚠ 저장소 루트에 pyrightconfig.json 이 있으면 Pylance 가 그 파일을 우선하여
+  //   아래 python.analysis.* 설정을 무시한다. 둘을 함께 두지 않는다.
+  "python.analysis.extraPaths": [
+    ".",
+    "practice/practice_utils/practice0",
+    "practice/practice_utils/practice1",
+    "practice/practice_utils/practice2"
+  ],
+
+  // 이 저장소에는 타입 검사 설정이 없다. basic 이상으로 켜면 벤더링된 devkit 에서
+  // 경고가 대량으로 뜨므로, 목적(코드 탐색)에 맞게 끈다.
+  "python.analysis.typeCheckingMode": "off",
+
+  // 인덱싱 대상에서 빼 Pylance 시작을 가볍게 한다.
+  // import 해석에는 계속 쓰이므로 정의로 이동은 그대로 동작한다.
+  "python.analysis.exclude": [
+    "data/**",
+    "Trajectory_refinement/acados/**",
+    "**/c_generated_code/**",
+    "**/__pycache__/**",
+    "**/.ipynb_checkpoints/**"
+  ],
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.ipynb_checkpoints": true
+  }
+}

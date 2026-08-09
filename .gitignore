@@ -1,0 +1,93 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.pytest_cache/
+
+# Type checker / linter caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Agent
+CLAUDE.md
+.claude/
+
+# Workspace ignore
+slurm/
+dataset/
+data/
+src/planners/incremental_planner.py
+
+# acados 본체(약 400MB)는 추적하지 않는다. `bash script/install_acados.sh` 로 받는다.
+Trajectory_refinement/acados/
+
+# acados 빌드 산출물. 절대경로가 박혀 있어 다른 머신으로 옮기면 안 된다.
+# 새 환경에서는 `bash script/build_mpc.sh` 로 다시 생성한다.
+Trajectory_refinement/refinementMPC/c_generated_code/
+Trajectory_refinement/refinementMPC/acados_ocp.json
+
+# 시뮬레이션 산출물
+videos/
+trajectory_evaluator_results/

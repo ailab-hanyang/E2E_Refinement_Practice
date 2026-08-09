@@ -1,0 +1,33 @@
+# ML 추론 + MPC refinement 실습 planner. 모델 교체: planner/model_adapter=pluto|diffusion
+defaults:
+  - _self_
+  - model_adapter: pluto
+
+refinement_planner:
+  _target_: src.planners.refinement_planner.RefinementPlanner
+  _convert_: "all"
+
+  # ── 실습 2: Refinement ─────────────────────────────────────────────
+  # acados 가 없으면 어차피 ML-only 로 강등된다. MPC 가 있는데도 끄고 싶을 때 false.
+  use_refinement: true
+
+  # ── 실습 3: 실시간 채점 ────────────────────────────────────────────
+  eval_dt: 0.1
+  eval_num_frames: 80              # 0.1s × 80 = 8s = 계획 궤적 전체
+  score_safety_horizon_steps: 10   # collision/TTC 만 1.0s 창
+
+  # Open-loop 지표(계획 궤적 vs 로그 ego). open_loop_boxes 런에서 켠다.
+  score_open_loop: false
+
+  # ── 실습 4: 주행 정책 ──────────────────────────────────────────────
+  # ml = ML 궤적 주행(refined 는 채점만), refine = MPC 궤적 주행. 둘을 각각 돌려 비교한다.
+  driving_policy: "ml"
+  refine_fallback_to_ml: true      # MPC 해가 못 쓸 상태면 ML 로 대체 주행
+
+  # ── 출력 ───────────────────────────────────────────────────────────
+  render: true
+  render_mode: "closed"            # closed | open — 화면 하단 지표를 결정한다
+  log_csv: true
+  save_dir: null
+
+  planner_ckpt: null   # 보통은 model_adapter 쪽에서 지정한다

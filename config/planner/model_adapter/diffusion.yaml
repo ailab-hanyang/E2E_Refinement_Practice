@@ -1,0 +1,29 @@
+# @package planner.refinement_planner.model_adapter
+#
+# Diffusion Planner 어댑터. feature 를 두 번 만든다 —
+# diffusion 자체 DataProcessor 는 모델 forward 용, PlutoFeatureBuilder 는 MPC 입력용.
+_target_: src.planners.model_adapters.diffusion_adapter.DiffusionModelAdapter
+_convert_: "all"
+
+# .pth 와 .json(정규화·아키텍처)은 짝이다.
+planner_ckpt: ${oc.env:PRACTICE_MODEL_ROOT}/diffusion_planner/diffusion_planner.pth
+args_file: ${oc.env:PRACTICE_MODEL_ROOT}/diffusion_planner/diffusion_planner.json
+
+enable_ema: true   # ckpt 에 ema_state_dict 키가 있어야 한다
+
+future_trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: "all"
+  num_poses: 80
+  time_horizon: 8
+
+# MPC 초기상태·경계용 기하 feature. pluto.yaml 의 feature_builder 와 같은 파라미터여야 한다.
+geometry_feature_builder:
+  _target_: src.feature_builders.pluto_feature_builder.PlutoFeatureBuilder
+  _convert_: "all"
+  radius: 120
+  history_horizon: 2
+  future_horizon: 8
+  sample_interval: 0.1
+  max_agents: 48
+  build_reference_line: true
