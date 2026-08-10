@@ -7,11 +7,20 @@ refinement_planner:
   _target_: src.planners.refinement_planner.RefinementPlanner
   _convert_: "all"
 
-  # ── 실습 2: Refinement ─────────────────────────────────────────────
+  # ── 실습 3 §2: Smoothing (저역통과 필터) ───────────────────────────
+  # none | zerophase | causal | savgol.  none 이면 평활 궤적을 만들지 않는다.
+  # acados 와 무관하게 항상 동작한다 (numpy + scipy 만 쓴다).
+  smoothing: "none"
+  smoothing_cutoff_hz: 1.0         # 낮출수록 부드럽고, 낮출수록 회피 기동도 뭉개진다
+  smoothing_order: 2               # Butterworth 차수 (savgol 에서는 무시된다)
+  smoothing_savgol_window: 11      # Savitzky-Golay 창 길이 (홀수)
+  smoothing_savgol_polyorder: 3    # Savitzky-Golay 국소 다항식 차수
+
+  # ── 실습 3 §4: Refinement (MPC) ────────────────────────────────────
   # acados 가 없으면 어차피 ML-only 로 강등된다. MPC 가 있는데도 끄고 싶을 때 false.
   use_refinement: true
 
-  # ── 실습 3: 실시간 채점 ────────────────────────────────────────────
+  # ── 실시간 채점 ────────────────────────────────────────────────────
   eval_dt: 0.1
   eval_num_frames: 80              # 0.1s × 80 = 8s = 계획 궤적 전체
   score_safety_horizon_steps: 10   # collision/TTC 만 1.0s 창
@@ -19,8 +28,11 @@ refinement_planner:
   # Open-loop 지표(계획 궤적 vs 로그 ego). open_loop_boxes 런에서 켠다.
   score_open_loop: false
 
-  # ── 실습 4: 주행 정책 ──────────────────────────────────────────────
-  # ml = ML 궤적 주행(refined 는 채점만), refine = MPC 궤적 주행. 둘을 각각 돌려 비교한다.
+  # ── 실습 3 §7: 주행 정책 ───────────────────────────────────────────
+  # ml     = ML 궤적 주행 (평활·MPC 궤적은 채점만)
+  # smooth = 평활 궤적 주행 (smoothing != none 이어야 한다)
+  # refine = MPC 궤적 주행
+  # 셋을 각각 돌려 최종 점수를 비교한다.
   driving_policy: "ml"
   refine_fallback_to_ml: true      # MPC 해가 못 쓸 상태면 ML 로 대체 주행
 

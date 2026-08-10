@@ -107,8 +107,15 @@ def run(cmd: str, cwd=None) -> int:
 # ---------------------------------------------------------------------------
 
 #: 흔한 한글 폰트. 앞에서부터 찾아 처음 걸리는 것을 쓴다.
-_KOREAN_FONTS = ("NanumGothic", "Noto Sans CJK KR", "Noto Sans KR", "Malgun Gothic",
-                 "AppleGothic", "UnDotum", "Baekmuk Gulim", "D2Coding")
+#: `Noto Sans CJK KR` 은 일부러 빼 두었다 — matplotlib 은 .ttc 컬렉션의 첫 face 만
+#: 등록하므로 NotoSansCJK-Regular.ttc 는 리눅스에서 늘 `Noto Sans CJK JP` 라는 이름으로
+#: 잡힌다. 같은 pan-CJK 글리프 세트라 그 이름으로 써도 한글은 그대로 나온다.
+_KOREAN_FONTS = ("NanumGothic", "NanumBarunGothic", "Malgun Gothic", "Noto Sans CJK JP",
+                 "Noto Sans KR", "AppleGothic", "UnDotum", "Baekmuk Gulim", "D2Coding")
+
+#: 위 폰트들의 파일 이름 조각. 캐시에 없는 폰트를 직접 등록할 때 쓴다.
+_KOREAN_FONT_FILES = ("nanum", "notosanscjk", "notoserifcjk", "malgun", "notosanskr",
+                      "gulim", "batang", "d2coding")
 
 
 def setup_korean_font(verbose: bool = True) -> Optional[str]:
@@ -117,10 +124,25 @@ def setup_korean_font(verbose: bool = True) -> Optional[str]:
     설정하지 않으면 축 라벨의 한글이 네모(□)로 나온다. 그림 자체는 정상이므로
     치명적이지는 않지만, 실습 중에 "그림이 깨졌다" 는 질문이 반복해서 나온다.
 
+    ⚠ `fontManager.ttflist` 는 `~/.cache/matplotlib/fontlist-*.json` 캐시를 그대로 읽은
+      것이다. 캐시를 만든 뒤에 폰트를 설치했다면 목록에 영영 나타나지 않아, 폰트가
+      깔려 있는데도 tofu 가 난다. 그래서 디스크를 먼저 훑어 등록한 다음 고른다.
+
     :return: 사용하기로 한 폰트 이름. 못 찾았으면 None.
     """
     import matplotlib
     from matplotlib import font_manager
+
+    # WSL 의 윈도우 폰트는 findSystemFonts() 가 훑지 않는 위치라 따로 붙인다.
+    known = {f.fname for f in font_manager.fontManager.ttflist}
+    for path in (*font_manager.findSystemFonts(), "/mnt/c/Windows/Fonts/malgun.ttf"):
+        name = Path(path).name.lower().replace(" ", "").replace("-", "")
+        if path in known or not any(k in name for k in _KOREAN_FONT_FILES):
+            continue
+        try:
+            font_manager.fontManager.addfont(path)
+        except Exception:  # 깨진 폰트 파일 하나 때문에 실습이 멈추면 안 된다.
+            pass
 
     available = {f.name for f in font_manager.fontManager.ttflist}
     picked = next((f for f in _KOREAN_FONTS if f in available), None)

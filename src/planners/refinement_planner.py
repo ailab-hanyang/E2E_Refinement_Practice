@@ -2,23 +2,31 @@
 
 한 스텝의 흐름:
     [1] ML 추론      어댑터가 ego-local 궤적 하나를 만든다
-    [2] 채점 world   로그에서 주변 agent 의 미래를 한 번 조회한다
-    [3] Refinement   [1] 을 reference 로 MPC 를 풀어 개선 궤적을 만든다
-    [4] 채점         두 궤적을 같은 조건에서 nuPlan 공식 metric 으로 매긴다 (표시용)
-    [5] 궤적 선택    driving_policy 에 따라 둘 중 하나를 주행 궤적으로 정한다
-    [6] 기록 / 렌더  CSV 한 줄과 프레임 한 장을 남긴다
+    [2] Smoothing    [1] 에 저역통과 필터를 걸어 평활 궤적을 만든다
+    [3] 채점 world   로그에서 주변 agent 의 미래를 한 번 조회한다
+    [4] Refinement   [1] 을 reference 로 MPC 를 풀어 개선 궤적을 만든다
+    [5] 채점         세 궤적을 같은 조건에서 nuPlan 공식 metric 으로 매긴다 (표시용)
+    [6] 궤적 선택    driving_policy 에 따라 셋 중 하나를 주행 궤적으로 정한다
+    [7] 기록 / 렌더  CSV 한 줄과 프레임 한 장을 남긴다
 
-acados 가 없으면 경고만 남기고 ML-only 로 동작한다.
+[2] 와 [4] 는 둘 다 **[1] 의 ML 궤적을** 입력으로 받는 병렬 가지다. 평활 궤적을
+MPC 의 reference 로 넣으면 두 후처리의 효과가 섞여 어느 쪽 기여인지 가릴 수 없다.
+
+acados 가 없으면 경고만 남기고 ML-only 로 동작한다. Smoothing 은 numpy·scipy 만
+쓰므로 acados 없이도 항상 동작한다.
 """
 
 import csv
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type
 
 import numpy as np
+import shapely
 import torch
+from PIL import Image
 
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
@@ -32,6 +40,7 @@ from nuplan.planning.simulation.planner.abstract_planner import (
     PlannerInput,
     PlannerReport,
 )
+from nuplan.planning.simulation.planner.planner_report import MLPlannerReport
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import (
     InterpolatedTrajectory,
@@ -51,13 +60,17 @@ from src.planners.evaluator import (
 from ..scenario_manager.scenario_manager import ScenarioManager
 from .ml_planner_utils import global_trajectory_to_states
 from .model_adapters import PlannerModelAdapter, PlutoModelAdapter
+from .postprocess import SMOOTHING_MODES, make_smoother
 from .utils.agent_world import agents_to_local_info
 
 logger = logging.getLogger(__name__)
 
-DRIVING_POLICIES = ("ml", "refine")
-#: 화면 하단에 그릴 지표. open 은 Open-loop 런 전용 렌더러를 쓴다.
+DRIVING_POLICIES = ("ml", "smooth", "refine")
+#: 화면 하단에 그릴 지표. open 은 Open-loop 표·오차 패널로 바꾼다.
 RENDER_MODES = ("closed", "open")
+
+#: 채점·CSV·화면에서 쓰는 후보 이름. 순서가 곧 점수표의 열 순서다.
+ML, SMOOTH, REFINE = "ml", "sm", "rf"
 
 # MPC 해의 주행 가능 판정 문턱값.
 _START_BEHIND_M = -0.5       # 궤적이 ego 뒤에서 시작하면 기각 (속도와 무관한 이상)
@@ -81,14 +94,21 @@ class RefinementPlanner(AbstractPlanner):
         planner_ckpt: str = None,
         scenario: AbstractScenario = None,
         use_gpu: bool = True,
-        # ── Refinement (실습 2) ─────────────────────────────────────────
+        # ── Smoothing (실습 3 §2 — 저역통과 필터) ───────────────────────
+        smoothing: str = "none",           # none | zerophase | causal | savgol
+        smoothing_cutoff_hz: float = 1.0,
+        smoothing_order: int = 2,
+        smoothing_savgol_window: int = 11,
+        smoothing_savgol_polyorder: int = 3,
+        # ── Refinement (실습 3 §4 — MPC) ────────────────────────────────
         use_refinement: bool = True,
-        # ── 채점 (실습 3) ───────────────────────────────────────────────
+        # ── 채점 ────────────────────────────────────────────────────────
         eval_dt: float = 0.1,
         eval_num_frames: int = 80,
+        score_forward_simulate: bool = True,   # LQR+bicycle 로 rollout 한 궤적을 채점
         score_safety_horizon_steps: Optional[int] = 10,  # collision/TTC 만 1.0 s 창
         score_open_loop: bool = False,         # 계획 궤적 vs 로그 ego (ADE/FDE/AHE/FHE/MR)
-        # ── 주행 정책 (실습 4) ──────────────────────────────────────────
+        # ── 주행 정책 (실습 3 §7) ───────────────────────────────────────
         driving_policy: str = "ml",
         refine_fallback_to_ml: bool = True,    # MPC 해가 못 쓸 상태면 ML 로 주행
         # ── 출력 ────────────────────────────────────────────────────────
@@ -96,6 +116,8 @@ class RefinementPlanner(AbstractPlanner):
         render_mode: str = "closed",           # closed | open — 화면 하단에 그릴 지표
         save_dir: str = None,
         log_csv: bool = True,
+        save_png: bool = False,
+        png_score_below: float = 1.0,
     ) -> None:
         if driving_policy not in DRIVING_POLICIES:
             raise ValueError(
@@ -105,14 +127,34 @@ class RefinementPlanner(AbstractPlanner):
             raise ValueError(
                 f"render_mode must be one of {RENDER_MODES}, got {render_mode!r}"
             )
+        if smoothing not in SMOOTHING_MODES:
+            raise ValueError(
+                f"smoothing must be one of {SMOOTHING_MODES}, got {smoothing!r}"
+            )
+        if driving_policy == "smooth" and smoothing == "none":
+            raise ValueError(
+                'driving_policy="smooth" 인데 smoothing="none" 입니다. '
+                "주행할 평활 궤적이 만들어지지 않습니다."
+            )
 
         self._scenario = scenario
         self._render = bool(render)
         self._render_mode = render_mode
+        self._save_png = bool(save_png)
+        self._png_score_below = float(png_score_below)
         self._log_csv = bool(log_csv)
         self._use_refinement = bool(use_refinement)
         self._driving_policy = driving_policy
         self._refine_fallback_to_ml = bool(refine_fallback_to_ml)
+
+        # 상태가 없는 순수 함수라 여기서 한 번 만들어 끝까지 재사용한다.
+        # smoothing="none" 이면 None 이고, 아래 흐름이 통째로 건너뛴다.
+        self._smoother = make_smoother(
+            mode=smoothing, dt=float(eval_dt),
+            cutoff_hz=smoothing_cutoff_hz, order=smoothing_order,
+            savgol_window=smoothing_savgol_window,
+            savgol_polyorder=smoothing_savgol_polyorder,
+        )
 
         if use_gpu:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -136,12 +178,15 @@ class RefinementPlanner(AbstractPlanner):
         self._eval_num_frames = int(eval_num_frames)
 
         self._imgs: List[np.ndarray] = []
+        self._feature_building_runtimes: List[float] = []
+        self._inference_runtimes: List[float] = []
 
         self._scorer = NuPlanTrajectoryScorer(
             scenario,
             dt=self._step_interval,
             horizon_steps=self._eval_num_frames,
             safety_horizon_steps=score_safety_horizon_steps,
+            forward_simulate=score_forward_simulate,
             score_open_loop=score_open_loop,
         )
 
@@ -177,8 +222,7 @@ class RefinementPlanner(AbstractPlanner):
             out.mkdir(parents=True, exist_ok=True)
             self._csv_path = str(out / f"{os.getpid()}.csv")
 
-        # 시나리오마다 planner 가 새로 만들어지는 것이 정상이지만, 노트북에서 손으로
-        # 루프를 돌리면 재사용되므로 Open-loop 누적기를 여기서 명시적으로 비운다.
+        # 노트북에서 planner 를 재사용하면 Open-loop 누적기가 남으므로 여기서 비운다.
         self._scorer.reset_open_loop()
 
         self._scene_render = (
@@ -202,9 +246,11 @@ class RefinementPlanner(AbstractPlanner):
     ) -> AbstractTrajectory:
         """시뮬레이터가 매 스텝 부르는 함수. 이 실습의 본체다.
 
-        아래 [1]~[6] 순서로 한 스텝을 처리하고, 시뮬레이터에 넘길 궤적 하나를 돌려준다.
+        아래 [1]~[7] 순서로 한 스텝을 처리하고, 시뮬레이터에 넘길 궤적 하나를 돌려준다.
         시뮬레이터는 이 궤적을 LQR 로 추종해 다음 ego 상태를 만든다.
         """
+        start_time = time.perf_counter()
+
         ego_state = current_input.history.ego_states[-1]
         iteration = current_input.iteration.index
 
@@ -215,8 +261,12 @@ class RefinementPlanner(AbstractPlanner):
         ao = self._adapter.build_and_forward(current_input, self._initialization)
         ml_local = ao.ml_local.cpu().numpy()
         ml_global = self._to_global_trajectory(ml_local, ego_state)
+        self._inference_runtimes.append(time.perf_counter() - start_time)
 
-        # [2] 채점 world — 주변 agent 의 미래를 한 번만 조회해 채점·MPC·렌더가 공유한다.
+        # [2] Smoothing — ML 궤적의 고주파 성분을 깎는다. 지도도 주변 차량도 보지 않는다.
+        sm_local, sm_global = self._smooth(ml_local, ego_state)
+
+        # [3] 채점 world — 주변 agent 의 미래를 한 번만 조회해 채점·MPC·렌더가 공유한다.
         #     비싼 호출이다 (0.64 s/step).
         tracked = self._scenario.get_tracked_objects_at_iteration(
             iteration,
@@ -228,25 +278,27 @@ class RefinementPlanner(AbstractPlanner):
             tracked.tracked_objects.get_agents(), ego_state, self._eval_num_frames + 1
         )
 
-        # [3] Refinement — ML 궤적을 reference 로 MPC 를 풀어 개선 궤적을 만든다.
+        # [4] Refinement — ML 궤적을 reference 로 MPC 를 풀어 개선 궤적을 만든다.
         refine_local, refine_global, refine_ok, refine_reason = self._refine(
             ao, agents_local, ego_state, iteration
         )
 
-        # [4] 채점 — 두 궤적을 같은 조건에서 공식 metric 으로 매긴다 (표시·비교용).
-        scores = self._score_step(iteration, ego_state, ml_global, refine_global, tracked)
-
-        # [5] 궤적 선택 — driving_policy 에 따라 실제로 주행할 궤적을 정한다.
-        executed, trajectory = self._select_trajectory(
-            ml_global, refine_global, refine_ok, refine_reason, iteration
+        # [5] 채점 — 세 궤적을 같은 조건에서 공식 metric 으로 매긴다 (표시·비교용).
+        scores = self._score_step(
+            iteration, ego_state, ml_global, sm_global, refine_global, tracked
         )
 
-        # [6] 기록 / 렌더 — CSV 한 줄과 프레임 한 장을 남긴다.
+        # [6] 궤적 선택 — driving_policy 에 따라 실제로 주행할 궤적을 정한다.
+        executed, trajectory = self._select_trajectory(
+            ml_global, sm_global, refine_global, refine_ok, refine_reason, iteration
+        )
+
+        # [7] 기록 / 렌더 — CSV 한 줄과 프레임 한 장을 남긴다.
         if self._log_csv and scores:
             self._append_csv(iteration, scores, executed, refine_reason)
         if self._render and scores:
             self._render_step(
-                current_input, ml_local, refine_local, scores,
+                current_input, ml_local, sm_local, refine_local, scores,
                 agents_local["predictions"], executed, refine_reason,
             )
 
@@ -266,8 +318,10 @@ class RefinementPlanner(AbstractPlanner):
 
         스텝마다 저장하면 매번 재인코딩이 일어나 크게 느려지므로 여기서 한 번에 쓴다.
         """
-        report = PlannerReport(
-            compute_trajectory_runtimes=self._compute_trajectory_runtimes
+        report = MLPlannerReport(
+            compute_trajectory_runtimes=self._compute_trajectory_runtimes,
+            feature_building_runtimes=self._feature_building_runtimes,
+            inference_runtimes=self._inference_runtimes,
         )
 
         # 영상 저장은 시나리오가 끝날 때 한 번만 한다.
@@ -282,14 +336,41 @@ class RefinementPlanner(AbstractPlanner):
             logger.info("video saved to %s", path)
 
         if clear_stats:
-            # 시나리오 간 누적 방지 — worker 가 여러 시나리오를 순차 처리한다.
             self._compute_trajectory_runtimes: List[float] = []
+            self._feature_building_runtimes = []
+            # 시나리오 간 누적 방지 — worker 가 여러 시나리오를 순차 처리한다.
+            self._inference_runtimes = []
             self._imgs.clear()
 
         return report
 
     # ------------------------------------------------------------------
-    # [3] Refinement — MPC 풀이와 해의 주행 가능 판정
+    # [2] Smoothing — 저역통과 필터
+    # ------------------------------------------------------------------
+
+    def _smooth(
+        self, ml_local: np.ndarray, ego_state: EgoState
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """[2단계] ML 궤적에 저역통과 필터를 걸어 평활 궤적을 만든다.
+
+        MPC 와 달리 실패할 구석이 없다 — 최적화가 아니라 필터라 항상 답이 나오고,
+        총 이동거리와 시작점이 보존된다. 그래서 `_refine` 과 달리 유효성 판정도
+        fallback 도 없다. 대신 **아무것도 보장하지 않는다**: 부드러워진 궤적이
+        여전히 차선 밖을 향할 수 있다.
+
+        `origin=(0,0,0)` 은 ego-local 좌표에서 현재 자차 위치다. 첫 웨이포인트까지의
+        증분도 필터에 넣어야 궤적 머리가 현재 위치에서 튀지 않는다.
+
+        :return: (평활궤적 ego-local, 평활궤적 global). 필터가 꺼져 있으면 (None, None).
+        """
+        if self._smoother is None:
+            return None, None
+
+        sm_local = self._smoother(ml_local, origin=(0.0, 0.0, 0.0))
+        return sm_local, self._to_global_trajectory(sm_local, ego_state)
+
+    # ------------------------------------------------------------------
+    # [4] Refinement — MPC 풀이와 해의 주행 가능 판정
     # ------------------------------------------------------------------
 
     def _build_mpc(self):
@@ -319,7 +400,7 @@ class RefinementPlanner(AbstractPlanner):
     def _refine(
         self, ao, agents_local: Dict, ego_state: EgoState, iteration: int
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], bool, Optional[str]]:
-        """[3단계] ML 궤적을 기준선(reference)으로 삼아 MPC 를 풀어 개선 궤적을 만든다.
+        """[4단계] ML 궤적을 기준선(reference)으로 삼아 MPC 를 풀어 개선 궤적을 만든다.
 
         MPC 는 지도를 직접 보지 않는다. 우리가 넣어 주는 기준선과 제약(차선 경계,
         주변 차량)만 보고 그 근처에서 더 부드럽고 안전한 궤적을 찾는다.
@@ -385,7 +466,7 @@ class RefinementPlanner(AbstractPlanner):
         return True, (f"solver_status={status}" if status != 0 else None)
 
     # ------------------------------------------------------------------
-    # [4] 채점 — 두 궤적을 같은 context 로 채점한다
+    # [5] 채점 — 세 궤적을 같은 context 로 채점한다
     # ------------------------------------------------------------------
 
     def _score_step(
@@ -393,13 +474,17 @@ class RefinementPlanner(AbstractPlanner):
         iteration: int,
         ego_state: EgoState,
         ml_global: np.ndarray,
+        sm_global: Optional[np.ndarray],
         refine_global: Optional[np.ndarray],
         tracked,
     ) -> Dict[str, TrajectoryScore]:
-        """[4단계] 두 궤적을 nuPlan 공식 지표로 채점한다. 실습 3 이 보는 숫자다.
+        """[5단계] 각 궤적을 nuPlan 공식 지표로 채점한다. 실습 3 이 보는 숫자다.
 
-        핵심은 두 궤적을 완전히 같은 조건에서 채점한다는 점이다. 같은 ego 상태,
+        핵심은 모든 궤적을 완전히 같은 조건에서 채점한다는 점이다. 같은 ego 상태,
         같은 주변 차량, 같은 시간 창을 쓰므로 점수 차이는 오직 궤적 차이에서 온다.
+
+        dict 의 순서(ml → sm → rf)가 점수표의 열 순서이자 비교의 기준이다.
+        표의 행 색은 첫 열과 마지막 열을 견주어 정해진다.
 
         채점에 실패해도 빈 dict 만 돌려주고 주행은 계속한다. 채점은 보여주기 위한
         것이라, 여기서 예외를 터뜨려 시나리오를 통째로 잃을 이유가 없다.
@@ -408,22 +493,14 @@ class RefinementPlanner(AbstractPlanner):
             ctx = self._scorer.build_context(
                 iteration=iteration,
                 init_ego_state=ego_state,
-                # progress 사영 기준선. progress 계열은 PROGRESS_METRICS 로 만점
-                # 고정이라 최종 점수에 기여하지 않으므로 구하지 않는다.
-                baseline_path=None,
+                baseline_path=self._safe_baseline_path(ego_state),
                 tracked_objects=tracked,
             )
-            # 후보마다 따로 감싼다. rf 채점이 실패했다고 ml 행까지 사라지면, Open-loop
-            # 누적 프레임 수가 후보 사이에서 어긋난 채로 표에만 안 보이게 된다.
-            scores: Dict[str, TrajectoryScore] = {}
-            for name, traj in (("ml", ml_global), ("rf", refine_global)):
-                if traj is None:
-                    continue
-                try:
-                    scores[name] = self._scorer.score(traj, ctx, candidate=name)
-                except Exception as e:
-                    logger.warning("[%s] iter=%d: %s 채점 실패: %s",
-                                   getattr(self._scenario, "token", "?"), iteration, name, e)
+            scores = {ML: self._scorer.score(ml_global, ctx)}
+            if sm_global is not None:
+                scores[SMOOTH] = self._scorer.score(sm_global, ctx)
+            if refine_global is not None:
+                scores[REFINE] = self._scorer.score(refine_global, ctx)
             return scores
         except Exception as e:
             logger.warning(
@@ -432,43 +509,65 @@ class RefinementPlanner(AbstractPlanner):
             )
             return {}
 
+    def _safe_baseline_path(self, ego_state: EgoState):
+        """progress 사영 기준선. 없으면 None 을 돌려준다.
+
+        progress 계열은 PROGRESS_METRICS 로 만점 고정이라 최종 점수에 기여하지
+        않는다. 그래도 있으면 실측값이 diagnostics 에 남으므로 값싸게 구해 둔다.
+        """
+        try:
+            lines = self._scenario_manager.get_cached_reference_lines()
+            init_ref_points = np.array([r[0] for r in lines], dtype=np.float64)
+            init_distance = np.linalg.norm(
+                init_ref_points[:, :2] - ego_state.rear_axle.array, axis=-1
+            )
+            return shapely.LineString(lines[int(np.argmin(init_distance))][:, :2])
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
-    # [5] 궤적 선택 — driving_policy 와 MPC 해의 유효성만 본다 (점수는 보지 않는다)
+    # [6] 궤적 선택 — driving_policy 와 MPC 해의 유효성만 본다 (점수는 보지 않는다)
     # ------------------------------------------------------------------
 
     def _select_trajectory(
         self,
         ml_global: np.ndarray,
+        sm_global: Optional[np.ndarray],
         refine_global: Optional[np.ndarray],
         refine_ok: bool,
         refine_reason: Optional[str],
         iteration: int,
     ) -> Tuple[str, np.ndarray]:
-        """[5단계] 실제로 주행할 궤적을 고른다. 점수는 보지 않는다.
+        """[6단계] 실제로 주행할 궤적을 고른다. 점수는 보지 않는다.
 
-        어느 쪽으로 주행할지는 driving_policy 로 실행 전에 미리 정해 두고, 매 스텝
+        어느 것으로 주행할지는 driving_policy 로 실행 전에 미리 정해 두고, 매 스텝
         점수가 좋은 쪽으로 갈아타지 않는다. 그래야 "ML 로 끝까지 주행한 결과" 와
-        "refine 으로 끝까지 주행한 결과" 를 공정하게 비교할 수 있다 (실습 4).
+        "평활 궤적으로 끝까지 주행한 결과", "refine 으로 끝까지 주행한 결과" 를
+        공정하게 비교할 수 있다 (실습 3 §7).
 
         예외는 하나뿐이다. MPC 해가 수치적으로 못 쓸 상태이면 ML 로 되돌린다.
-        이것도 점수 비교가 아니라 안전 장치다.
+        이것도 점수 비교가 아니라 안전 장치다. Smoothing 에는 대응하는 장치가
+        없다 — 필터는 실패하지 않기 때문이다.
 
-        :return: (실제로 주행한 궤적 이름 "ml" 또는 "rf", 그 궤적)
+        :return: (실제로 주행한 궤적 이름 "ml" | "sm" | "rf", 그 궤적)
         """
+        if self._driving_policy == "smooth" and sm_global is not None:
+            return SMOOTH, sm_global
+
         if self._driving_policy != "refine" or refine_global is None:
-            return "ml", ml_global
+            return ML, ml_global
 
         if refine_ok or not self._refine_fallback_to_ml:
-            return "rf", refine_global
+            return REFINE, refine_global
 
         logger.warning(
             "[%s] iter=%d MPC 해 사용 불가(%s) → ML 로 대체 주행",
             getattr(self._scenario, "token", "?"), iteration, refine_reason,
         )
-        return "ml", ml_global
+        return ML, ml_global
 
     # ------------------------------------------------------------------
-    # [6] 기록 / 렌더 — 스텝별 CSV 와 프레임
+    # [7] 기록 / 렌더 — 스텝별 CSV 와 프레임
     # ------------------------------------------------------------------
 
     def _append_csv(
@@ -478,17 +577,30 @@ class RefinementPlanner(AbstractPlanner):
         executed: str,
         refine_reason: Optional[str],
     ) -> None:
-        """[6단계] 스텝마다 CSV 한 줄을 남긴다. 나중에 두 런을 정량 비교할 근거다.
+        """[7단계] 스텝마다 CSV 한 줄을 남긴다. 나중에 여러 런을 정량 비교할 근거다.
 
-        한 행에 ml_ 과 rf_ 접두사로 두 궤적의 지표를 나란히 적는다. 영상은 눈으로
+        한 행에 ml_ · sm_ · rf_ 접두사로 세 궤적의 지표를 나란히 적는다. 영상은 눈으로
         보는 용도이고, 숫자로 따지려면 이 CSV 가 필요하다.
+
+        열 구성은 **항상 세 후보 모두** 를 담는다. 필터나 MPC 가 꺼져 있으면 그쪽 칸이
+        빈 값이 될 뿐이다. 런마다 열이 달라지면 여러 런의 CSV 를 이어 붙일 수 없다.
         """
-        ml_row = scores["ml"].as_row()
+        ml_score = scores[ML]
+        ml_row = ml_score.as_row()
         metric_keys = [
             k for k in ml_row if k not in ("final_score", "neutralized_metrics")
         ]
-        rf = scores.get("rf")
-        rf_row = rf.as_row() if rf is not None else {}
+
+        rows = {
+            name: (scores[name].as_row() if name in scores else {})
+            for name in (ML, SMOOTH, REFINE)
+        }
+
+        def _final(name: str):
+            return scores[name].final if name in scores else ""
+
+        def _delta(name: str):
+            return (scores[name].final - ml_score.final) if name in scores else ""
 
         with open(self._csv_path, "a", newline="") as f:
             writer = csv.writer(f)
@@ -496,36 +608,37 @@ class RefinementPlanner(AbstractPlanner):
                 writer.writerow(
                     ["log_name", "token", "iteration",
                      "driving_policy", "executed", "refine_reason",
-                     "ml_final", "rf_final", "delta"]
-                    + [f"ml_{k}" for k in metric_keys]
-                    + [f"rf_{k}" for k in metric_keys]
+                     "ml_final", "sm_final", "rf_final", "sm_delta", "delta"]
+                    + [f"{name}_{k}" for name in (ML, SMOOTH, REFINE) for k in metric_keys]
                 )
-            delta = (rf.final - scores["ml"].final) if rf is not None else ""
             writer.writerow(
                 [self._scenario.log_name, self._scenario.token, iteration,
                  self._driving_policy, executed, refine_reason or "",
-                 scores["ml"].final, rf.final if rf is not None else "", delta]
-                + [ml_row[k] for k in metric_keys]
-                + [rf_row.get(k, "") for k in metric_keys]
+                 ml_score.final, _final(SMOOTH), _final(REFINE),
+                 _delta(SMOOTH), _delta(REFINE)]
+                + [rows[name].get(k, "") for name in (ML, SMOOTH, REFINE)
+                   for k in metric_keys]
             )
 
     def _render_step(
         self,
         current_input: PlannerInput,
         ml_local: np.ndarray,
+        sm_local: Optional[np.ndarray],
         refine_local: Optional[np.ndarray],
         scores: Dict[str, TrajectoryScore],
         agent_future: np.ndarray,
         executed: str,
         refine_reason: Optional[str],
     ) -> None:
-        """[6단계] 이번 스텝을 그림 한 장으로 그린다. 실습 3 의 화면이다.
+        """[7단계] 이번 스텝을 그림 한 장으로 그린다. 실습 3 의 화면이다.
 
-        ML 궤적은 실선, MPC 개선 궤적은 점선으로 겹쳐 그리고, 왼쪽 아래에 두 궤적의
-        점수표를 붙인다. MPC 가 없으면 표가 한 열이 되고, 있으면 ml/rf 비교 열이 된다.
+        ML 궤적은 자홍 실선, 평활 궤적은 초록 점선, MPC 개선 궤적은 파랑 점선으로
+        겹쳐 그리고, 왼쪽 아래에 각 궤적의 점수표를 붙인다. 꺼져 있는 후처리는
+        선도 열도 나타나지 않으므로, 표의 열 수가 곧 지금 비교 중인 궤적 수다.
         """
         # 화면 하단 한 줄. 길어지면 오른쪽 comfort 패널에 가려진다.
-        summary = {"driving": "ML" if executed == "ml" else "REFINE"}
+        summary = {"driving": {ML: "ML", SMOOTH: "SMOOTH", REFINE: "REFINE"}[executed]}
         if refine_reason:
             summary["mpc"] = refine_reason
         panel = build_score_panel(scores, summary=summary)
@@ -537,21 +650,32 @@ class RefinementPlanner(AbstractPlanner):
             scenario=self._scenario,
             iteration=current_input.iteration.index,
             planning_trajectory=ml_local,
+            smoothed_trajectory=sm_local,
             refined_trajectory=refine_local,
-            # 궤적은 ML 하나와 MPC 하나뿐이다.
+            # 궤적은 위 셋뿐이다.
             candidate_trajectories=None,
             # agent 미래는 채점에 쓴 GT 로그를 그대로 그린다.
             predictions=None,
             agent_future_log=agent_future,
+            dagger_information=None,   # summary 는 panel 이 들고 있다
             evaluator_result=panel,
             reason_detail={
                 "comfort": panel,
                 "ttc": {name: panel.ttc.get(name) for name in scores},
-                "collision": {"ml": list(highlight_tokens(panel))},
+                "collision": {ML: list(highlight_tokens(panel))},
             },
             return_img=True,
         )
         self._imgs.append(img)
+
+        if self._save_png and scores[ML].final < self._png_score_below:
+            out = (
+                Path(self.video_dir) / "steps"
+                / f"{self._scenario.log_name}_{self._scenario.token}"
+                f"_{current_input.iteration.index}.png"
+            )
+            out.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(img).save(out)
 
     # ------------------------------------------------------------------
     # 좌표 유틸 — ego-local (T,3) 을 global 로 옮긴다

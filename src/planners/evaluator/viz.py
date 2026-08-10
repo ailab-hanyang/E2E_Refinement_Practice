@@ -85,12 +85,14 @@ CMP_WORSE = "#C0392B"
 CMP_SAME = "#1A1A1A"
 CMP_EPS = 1e-6
 
-#: 후보별 계열 색. ML=회색, refined=파랑, 그 외는 순환.
+#: 후보별 계열 색. ML=회색, smoothed=초록, refined=파랑, 그 외는 순환.
+#: 지도 위 궤적 색과 같게 맞춘다 (feature_builders/nuplan_scenario_render.py).
 _CANDIDATE_COLOURS = {
     "ml": "#666666",
+    "sm": "#2E8B57",
     "rf": "#1F5FB4",
 }
-_FALLBACK_COLOURS = ("#2E8B57", "#B8860B", "#8E44AD", "#16A085")
+_FALLBACK_COLOURS = ("#B8860B", "#8E44AD", "#16A085", "#D6249F")
 
 #: 위반 표시 색 (comfort 초과 구간, TTC 충돌 지점, at-fault 충돌 상대)
 BAD = "#C0392B"
