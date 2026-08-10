@@ -32,7 +32,7 @@ sudo apt install git curl
 | 0 | [practice0_environment_setting.ipynb](practice/practice0_environment_setting.ipynb) | conda 환경 생성 · 패키지 · acados · MPC 솔버 빌드 · 데이터 확인 · 스모크 런 2회 |
 | 1 | [practice1_nuplan_framework.ipynb](practice/practice1_nuplan_framework.ipynb) | nuPlan 프레임워크 — 시나리오가 어디서 오고, ego 가 어떻게 움직이고, 무엇을 교체할 수 있는가 |
 | 2 | [practice2_ml_planner_evaluation.ipynb](practice/practice2_ml_planner_evaluation.ipynb) | ML planner(PLUTO) 장착 · Open-loop 와 Closed-loop 평가 · 영상과 지표 |
-| 3 | *(준비 중)* | MPC refinement — ML 궤적 후처리와 스텝별 비교 |
+| 3 | [practice3_ml_planner_refinement.ipynb](practice/practice3_ml_planner_refinement.ipynb) | MPC refinement — ML 궤적 후처리와 스텝별 비교 |
 
 실습 1 은 규칙 기반 planner 만을 사용하므로 GPU 와 acados 가 필요하지 않다.
 실습 2 는 모델 추론에 GPU 를 쓰지만 acados 는 필요하지 않다. MPC 는 실습 3 에서 도입된다.
