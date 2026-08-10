@@ -155,6 +155,7 @@ class NuplanScenarioRender:
         agent_attn_weights=None,
         candidate_index=None,
         return_img=True,
+        smoothed_trajectory=None,
         refined_trajectory=None,
         dagger_information=None,
         evaluator_result=None, # {"ml": {metric: v}, "rf": {metric: v}}  (구 형식도 허용)
@@ -200,6 +201,7 @@ class NuplanScenarioRender:
             predictions=predictions,
             agent_attn_weights=agent_attn_weights,
             return_img=return_img,
+            smoothed_trajectory=smoothed_trajectory,
             refined_trajectory=refined_trajectory,
             dagger_information=dagger_information,
             evaluator_result=evaluator_result,
@@ -370,6 +372,7 @@ class NuplanScenarioRender:
         predictions=None,
         agent_attn_weights=None,
         return_img=False,
+        smoothed_trajectory=None,
         refined_trajectory=None,
         dagger_information=None,
         evaluator_result=None, # {"ml": {metric: v}, "rf": {metric: v}}  (구 형식도 허용)
@@ -427,14 +430,17 @@ class NuplanScenarioRender:
             gt_trajectory = np.matmul(gt_trajectory - self.origin, self.rot_mat)
             ax.plot(gt_trajectory[:, 0], gt_trajectory[:, 1], color="blue", alpha=0.5)
 
-        # TTC 위반을 만든 객체 토큰 — ML/refined 어느 쪽이든 걸린 객체를 빨갛게 칠한다
+        # TTC 위반을 만든 객체 토큰 — 어느 후보(ml/sm/rf)에서든 걸린 객체를 빨갛게 칠한다.
+        # 후보 이름을 열거하지 않고 넘어온 dict 의 키를 그대로 순회한다.
+        ttc_detail = (reason_detail or {}).get("ttc") or {}
+        collision_detail = (reason_detail or {}).get("collision") or {}
         hit_tokens = set()
-        for side in ("ml", "rf"):
-            v = ((reason_detail or {}).get("ttc") or {}).get(side)
+        for side in set(ttc_detail) | set(collision_detail):
+            v = ttc_detail.get(side)
             if v and v.get("track_token"):
                 hit_tokens.add(v["track_token"])
             # 실제 at-fault 충돌 상대도 같은 빨간색으로 (원인이 TTC 와 다를 수 있다)
-            hit_tokens.update(((reason_detail or {}).get("collision") or {}).get(side) or [])
+            hit_tokens.update(collision_detail.get(side) or [])
 
         if not self.disable_agent:
             for track in tracked_objects.tracked_objects:
@@ -443,7 +449,10 @@ class NuplanScenarioRender:
 
         if planning_trajectory is not None:
             self._plot_ml_planning(ax, planning_trajectory)
-     
+
+        if smoothed_trajectory is not None:
+            self._plot_smoothed_planning(ax, smoothed_trajectory)
+
         if refined_trajectory is not None:
             self._plot_refined_planning(ax, refined_trajectory)
 
@@ -643,6 +652,22 @@ class NuplanScenarioRender:
             color="#1F5FB4",
             color_change=False,
             linestyle="--",
+        )
+
+    def _plot_smoothed_planning(self, ax, smoothed_trajectory: np.ndarray):
+        # 저역통과 필터를 건 궤적 = 초록 **점선**. refined 와 같은 이유로 점선이다
+        # (ML 과 거의 겹치므로 실선이면 무엇이 바뀌었는지 화면에서 보이지 않는다).
+        # 색은 점수표·comfort 패널의 "sm" 계열색과 맞춘다 (evaluator/viz.py).
+        plot_polyline(
+            ax,
+            [smoothed_trajectory],
+            linewidth=2.5,
+            arrow=False,
+            zorder=8,
+            alpha=0.95,
+            color="#2E8B57",
+            color_change=False,
+            linestyle=":",
         )
 
     def _plot_ml_planning(self, ax, planning_trajectory: np.ndarray):
