@@ -278,16 +278,26 @@ class RefinementMPC:
         x   = vertcat(pos_x, pos_y, yaw, v, ax, delta)
         u   = vertcat(jerk, ddelta)
 
-        yaw_dot = v * SX.tan(delta) / self.wheel_base
+        # ── 빈칸 1-① : 운동학 자전거 모델 ───────────────────────────────────
+        # 상태 x = [pos_x, pos_y, yaw, v, ax, delta] 의 시간미분을 채운다.
+        # 기준점은 뒷축이고 축거는 self.wheel_base 다.
+        #   힌트 1) 뒷축 기준이면 속도 벡터의 방향이 곧 yaw 다.
+        #   힌트 2) 선회 반경 R = L / tan(delta) 이고, yaw_dot = v / R 이다.
+        #   힌트 3) v, ax, delta 의 미분은 이미 채워져 있다. 왜 ax 와 delta 가
+        #           입력이 아니라 상태인지 생각해 보라 (jerk 와 조향속도에 직접
+        #           제약을 걸기 위해서다 — 빈칸 2-⑤ 에서 다시 나온다).
+        # 채우지 않아도 빌드와 주행은 되지만 자차가 제자리에 머문다.
+        yaw_dot = 0.0 * v       # TODO
 
         f_expl = vertcat(
-            v * cos(yaw),   # pos_x_dot
-            v * sin(yaw),   # pos_y_dot
+            0.0 * v,        # TODO pos_x_dot
+            0.0 * v,        # TODO pos_y_dot
             yaw_dot,        # yaw_dot
             ax,             # v_dot
             jerk,           # ax_dot
             ddelta,         # delta_dot
         )
+        # ────────────────────────────────────────────────────────────────────
 
         xdot  = SX.sym('xdot', x.shape[0])
 
@@ -444,10 +454,22 @@ class RefinementMPC:
         )
 
         # Additional States for Adapting Comfort Metric
-        ay        = (v**2) * tan(delta) / self.wheel_base
-        jerk_mag    = jerk**2 + ((2 * v * ax * delta + (v**2) * ddelta) / self.wheel_base) ** 2
-        yawrate   = v * tan(delta) / self.wheel_base
-        yaw_accel = (ax * delta + v * ddelta) / self.wheel_base
+        # ── 빈칸 1-② : nuPlan comfort 지표를 상태의 함수로 유도한다 ──────────
+        # 이 MPC 의 핵심 아이디어다. nuPlan 이 채점하는 값을 상태 [v, ax, delta] 와
+        # 입력 [jerk, ddelta] 로 표현해 두면, 그대로 제약으로 걸 수 있다.
+        #   ay        : 횡가속도.   힌트) R = L / tan(delta), a_y = v² / R
+        #   yawrate   : 요레이트.   힌트) 위의 yaw_dot 과 같은 값이다
+        #   yaw_accel : 요각가속도. 힌트) yawrate 를 시간미분한다. v 와 delta 가
+        #               모두 변하므로 두 항이 나오고, 작은 조향각 근사
+        #               (tan δ ≈ δ, sec²δ ≈ 1) 를 쓴다.
+        # jerk_mag 는 예시로 채워 두었다 — 종저크(jerk)와 횡저크(= ay 의 시간미분)의
+        # 제곱합이며, nuPlan 의 magnitude jerk 에 대응한다.
+        # 채우지 않으면 comfort 제약 4개 중 3개가 상수 0 이 되어 무력해진다.
+        ay        = 0.0 * v     # TODO
+        jerk_mag  = jerk**2 + ((2 * v * ax * delta + (v**2) * ddelta) / self.wheel_base) ** 2
+        yawrate   = 0.0 * v     # TODO
+        yaw_accel = 0.0 * v     # TODO
+        # ────────────────────────────────────────────────────────────────────
 
         # Acceleration constraints
         vehicle_acceleration = VehicleAcceleration(
@@ -558,11 +580,22 @@ class RefinementMPC:
         # Boundary constraints
         # Left boundary: vehicle left corners should be less than left_y_lim
         # Constraint: left_y_lim - corner_y > 0  (corner_y < left_y_lim)
-        left_boundary_con1 = left_front_y_lim - front_left_y - self.boundary_margin   # Front left corner < left boundary
-        left_boundary_con2 = left_rear_y_lim - rear_left_y - self.boundary_margin     # Rear left corner < left boundary
+        # ── 빈칸 2-⑦ : 차선 경계 제약 ───────────────────────────────────────
+        # 경계는 "선"이 아니라 로컬 좌표계에서 **좌우로 얼마까지** 라는 상한값 4개로
+        # 들어온다: left_front_y_lim, left_rear_y_lim, right_front_y_lim, right_rear_y_lim.
+        # 위에서 구한 코너 4점이 그 한계 안에 있어야 한다. 전부 "≥ 0" 형태로 쓴다.
+        #   좌측 : 코너의 y 가 한계보다 **작아야** 한다
+        #   우측 : 코너의 y 가 한계보다 **커야** 한다  ← 부등호 방향이 반대다
+        #   여유 : self.boundary_margin 만큼 안쪽으로 당긴다
+        # 채우지 않으면 제약이 항상 만족되어 차선 밖으로 나가도 벌점이 없다.
+        LOOSE_BND = 0.0 * front_left_y + MPCConstants.Numerical.LARGE_POSITIVE
 
-        right_boundary_con1 = front_right_y - right_front_y_lim - self.boundary_margin # Front right corner > right boundary
-        right_boundary_con2 = rear_right_y - right_rear_y_lim - self.boundary_margin  # Rear right corner > right boundary
+        left_boundary_con1 = LOOSE_BND   # TODO Front left corner < left boundary
+        left_boundary_con2 = LOOSE_BND   # TODO Rear left corner  < left boundary
+
+        right_boundary_con1 = LOOSE_BND  # TODO Front right corner > right boundary
+        right_boundary_con2 = LOOSE_BND  # TODO Rear right corner  > right boundary
+        # ────────────────────────────────────────────────────────────────────
 
         con_h_expr = vertcat(ay, jerk_mag, yawrate, yaw_accel,        # 4
                              accel_con1, accel_con2, accel_con3,
@@ -685,22 +718,39 @@ class RefinementMPC:
         error_jerk_square = (u[0])**2
         error_ddelta_square = (u[1])**2
 
+        # ── 빈칸 1-③ : 포화 커널 ────────────────────────────────────────────
+        # kernel = (tanh(scale · error² + shift) + 1) / 2,  치역 [0, 1]
+        # kernel_x 는 예시로 채워 두었다. 나머지 넷을 같은 형태로 쓴다
+        # (self.kernel_scale_* 와 self.kernel_shift_* 를 각각 짝지어 쓴다).
+        #
+        # 채우지 않으면 오차 제곱이 그대로 비용이 되어 **이차 비용**이 된다.
+        # 그 상태로 빌드해서 §7 을 돌려 보면 커널을 쓰는 이유가 보인다 — 크게
+        # 틀린 한 점이 비용을 지배해 나머지 전 구간을 끌고 간다.
         kernel_x = (tanh(self.kernel_scale_x * error_x_square + self.kernel_shift_x) + 1.0) / 2.0
-        kernel_y = (tanh(self.kernel_scale_y * error_y_square + self.kernel_shift_y) + 1.0) / 2.0
-        kernel_yaw = (tanh(self.kernel_scale_yaw * error_yaw_square + self.kernel_shift_yaw) + 1.0) / 2.0
-        kernel_jerk = (tanh(self.kernel_scale_jerk * error_jerk_square + self.kernel_shift_jerk) + 1.0) / 2.0
-        kernel_ddelta = (tanh(self.kernel_scale_ddelta * error_ddelta_square + self.kernel_shift_ddelta) + 1.0) / 2.0
+        kernel_y = error_y_square           # TODO
+        kernel_yaw = error_yaw_square       # TODO
+        kernel_jerk = error_jerk_square     # TODO
+        kernel_ddelta = error_ddelta_square # TODO
+        # ────────────────────────────────────────────────────────────────────
 
         # Stage cost
         # Q_yaw 항은 heading 감쇠용이다. 위치 오차(비례항)만 있고 heading 이 없으면
         # 계단형 reference 에서 부족감쇠가 나 오버슈트한다 — 실측 |e0|=3.5 m 에서
         # 1.08 m 넘어간 뒤 진동. Q_yaw=0 이면 이 항은 상수라 종전과 동일하게 동작한다.
-        cost_expr = self.use_kernel_cost * (self.Q_x * kernel_x + self.Q_y * kernel_y +
-                                            self.Q_yaw * kernel_yaw +
-                                            self.R_jerk * kernel_jerk + self.R_ddelta * kernel_ddelta)
+        # ── 빈칸 1-④ : stage / terminal 비용 조립 ───────────────────────────
+        # stage    : 다섯 커널을 가중합한다. 추종 항은 self.Q_x / Q_y / Q_yaw,
+        #            입력 항은 self.R_jerk / R_ddelta 다.
+        #            전체에 self.use_kernel_cost 를 곱한다 (0 이면 통째로 꺼진다).
+        # terminal : 추종 항만 쓰고 self.Qe_x / Qe_y 를 곱한다.
+        #            self.use_kernel_cost_e 를 곱한다.
+        #            yaml 에서 Qe_* 가 전부 0 이고 use_kernel_cost_e 도 0 인 이유를
+        #            생각해 보라 — 이 MPC 는 끝점을 맞추는 것이 목적이 아니다.
+        # 채우지 않으면 x 방향 추종만 남아 횡방향이 기준선에서 멀어진다.
+        cost_expr = self.use_kernel_cost * (self.Q_x * kernel_x)                 # TODO
 
         # Terminal cost
-        cost_expr_ext = self.use_kernel_cost_e * (self.Qe_x * kernel_x + self.Qe_y * kernel_y)
+        cost_expr_ext = 0.0 * kernel_x                                           # TODO
+        # ────────────────────────────────────────────────────────────────────
 
         # Store cost expressions in the OCP model
         ocp.model.cost_expr_ext_cost = cost_expr
@@ -725,9 +775,23 @@ class RefinementMPC:
         #        Inputs: (jerk, ddelta)
         # ------------------------------------------------------------------ #
 
+        # ── 빈칸 2-⑤ : 상태·입력의 상자(box) 제약 ───────────────────────────
+        # idxbx = [3, 4, 5] → (v, ax, delta) 에, idxbu = [0, 1] → (jerk, ddelta) 에
+        # 상·하한을 건다. 빈칸 1-① 에서 ax 와 delta 를 상태로 둔 이유가 여기서 드러난다.
+        #   v     : 후진 금지. 하한을 0 이 아니라 아주 작은 음수(-0.001)로 둔다.
+        #           정확히 0 이면 정지 상태에서 수치오차만으로 제약을 위반한다.
+        #           상한은 MPCConstants.Numerical.LARGE_POSITIVE_FOR_CALC.
+        #   ax    : self.nuplan_min_lon_accel ~ self.nuplan_max_lon_accel
+        #   delta : ±self.max_delta [deg] → np.deg2rad 로 라디안 변환이 필요하다
+        #   jerk  : ±self.max_abs_lon_jerk
+        #   ddelta: ±self.max_ddelta [deg/s] → 마찬가지로 라디안 변환
+        # 아래 3) 터미널 제약에 정답과 같은 값이 채워져 있으니 비교해 보라.
+        # 채우지 않으면 조향각과 가속도가 물리적으로 불가능한 값까지 튄다.
+        LOOSE = MPCConstants.Numerical.LARGE_POSITIVE
+
         # 1) State Constraints
-        ocp.constraints.lbx = np.array([-0.001, self.nuplan_min_lon_accel, -np.deg2rad(self.max_delta)])
-        ocp.constraints.ubx = np.array([MPCConstants.Numerical.LARGE_POSITIVE_FOR_CALC , self.nuplan_max_lon_accel, np.deg2rad(self.max_delta)])
+        ocp.constraints.lbx = np.array([-LOOSE, -LOOSE, -LOOSE])  # TODO
+        ocp.constraints.ubx = np.array([ LOOSE,  LOOSE,  LOOSE])  # TODO
         ocp.constraints.idxbx = np.array([3, 4, 5])  # v, ax, delta
         ocp.dims.nbx = ocp.constraints.idxbx.shape[0]
         ocp.constraints.idxsbx = np.array([1])
@@ -745,9 +809,9 @@ class RefinementMPC:
         ocp.dims.nbx_e = ocp.constraints.idxbx_e.shape[0]
         ocp.constraints.idxsbx_e = np.array([1])
 
-        # 4) Input Constraints
-        ocp.constraints.lbu = np.array([-self.max_abs_lon_jerk, -np.deg2rad(self.max_ddelta)])
-        ocp.constraints.ubu = np.array([self.max_abs_lon_jerk, np.deg2rad(self.max_ddelta)])
+        # 4) Input Constraints                                    (빈칸 2-⑤ 계속)
+        ocp.constraints.lbu = np.array([-LOOSE, -LOOSE])  # TODO
+        ocp.constraints.ubu = np.array([ LOOSE,  LOOSE])  # TODO
         ocp.constraints.idxbu = np.array([0, 1])
         ocp.dims.nbu = ocp.constraints.idxbu.shape[0]
         ocp.constraints.idxsbu = np.array([0])
@@ -762,9 +826,20 @@ class RefinementMPC:
         """
         Setup nonlinear constraints (comfort and collision)
         """
+        # ── 빈칸 2-⑧ : comfort 상·하한과 lh / uh 조립 ───────────────────────
+        # con_h_expr 의 앞 4개는 빈칸 1-② 에서 만든 (ay, jerk_mag, yawrate, yaw_accel) 이다.
+        # 여기에 **nuPlan 채점 임계값 그 자체**를 상·하한으로 건다.
+        #   ay        : ±self.nuplan_max_abs_lat_accel
+        #   jerk_mag  : 하한 -0.001, 상한 self.nuplan_max_abs_mag_jerk ** 2
+        #               (jerk_mag 가 제곱합이므로 임계값도 제곱해야 한다)
+        #   yawrate   : ±self.nuplan_max_abs_yaw_rate
+        #   yaw_accel : ±self.nuplan_max_abs_yaw_accel
+        # 채우지 않으면 comfort 제약이 사실상 없는 것과 같다.
+        LOOSE_H = MPCConstants.Numerical.LARGE_POSITIVE
+
         # Comfort constraints
-        comfort_lh = np.array([-self.nuplan_max_abs_lat_accel, -0.001, -self.nuplan_max_abs_yaw_rate, -self.nuplan_max_abs_yaw_accel])
-        comfort_uh = np.array([self.nuplan_max_abs_lat_accel, self.nuplan_max_abs_mag_jerk ** 2, self.nuplan_max_abs_yaw_rate, self.nuplan_max_abs_yaw_accel])
+        comfort_lh = np.full(MPCConstants.COMFORT_CONSTRAINTS, -LOOSE_H)  # TODO
+        comfort_uh = np.full(MPCConstants.COMFORT_CONSTRAINTS,  LOOSE_H)  # TODO
 
         # Acceleration constraints
         acceleration_constraint_count = MPCConstants.ACCELERATION_CONSTRAINTS
@@ -779,10 +854,24 @@ class RefinementMPC:
         boundary_lh = np.zeros(MPCConstants.BOUNDARY_CONSTRAINTS)
         boundary_uh = np.full(MPCConstants.BOUNDARY_CONSTRAINTS, MPCConstants.Numerical.LARGE_POSITIVE)
 
-        ocp.constraints.lh = np.concatenate([comfort_lh, acceleration_lh, collision_lh, boundary_lh])
-        ocp.constraints.uh = np.concatenate([comfort_uh, acceleration_uh, collision_uh, boundary_uh])
+        # (빈칸 2-⑧ 계속) 위에서 만든 네 덩어리를 이어 붙인다.
+        # **순서가 CreateModel 의 con_h_expr 순서와 정확히 같아야 한다** —
+        # comfort(4) → acceleration(12) → collision(90+15) → boundary(4) = 125.
+        # 어긋나면 엉뚱한 제약에 엉뚱한 임계값이 걸리는데, 빌드는 성공하므로
+        # 에러 없이 궤적만 이상해진다.
+        # collision 과 acceleration 은 하한 0, 상한 LARGE_POSITIVE 인 **단측 제약**이다
+        # (위에 이미 채워져 있다). "≥ 0" 형태로 식을 쓴 이유가 이것이다.
+        _n_h = (MPCConstants.COMFORT_CONSTRAINTS + MPCConstants.ACCELERATION_CONSTRAINTS +
+                MPCConstants.AGENT_CONSTRAINTS + MPCConstants.PEDESTRIAN_CONSTRAINTS +
+                MPCConstants.BOUNDARY_CONSTRAINTS)
+        ocp.constraints.lh = np.full(_n_h, -LOOSE_H)  # TODO
+        ocp.constraints.uh = np.full(_n_h,  LOOSE_H)  # TODO
         ocp.dims.nh = ocp.constraints.lh.shape[0]
+        # idxsh 는 채워 두었다 — 비선형 제약을 **전부 soft** 로 만든다.
+        # hard 로 두면 만족하는 해가 없을 때 솔버가 아무 답도 내놓지 못한다.
+        # 실험: 아래를 np.array([], dtype=int) 로 바꿔 빌드하면 그 상황을 볼 수 있다.
         ocp.constraints.idxsh = np.arange(ocp.constraints.lh.shape[0], dtype=int)
+        # ────────────────────────────────────────────────────────────────────
 
     def SetupSoftConstraintWeights(self, ocp):
         """
@@ -1366,33 +1455,44 @@ class RefinementMPC:
         Returns:
             List of 9 constraint expressions
         """
-        # Distance threshold for collision
-        # collision_threshold = (agent.width/2 + self.width_half + self.safety_margin) ** 2
-        collision_threshold = agent.width/2 + self.width_half + self.safety_margin
-        # collision_threshold = 0.0
+        # ── 빈칸 2-⑥ : 상대 차량 충돌 제약 ──────────────────────────────────
+        # 자차 3점(rear / center / front) × 상대 궤적 3점 = 9개를 전부 "≥ 0" 으로 쓴다.
+        # 형태는 아래 CreatePedestrianCollisionConstraints 가 채워진 채 남아 있으니
+        # 비교하며 작성한다. 세 가지를 스스로 설명할 수 있어야 한다.
+        #
+        #   ⓐ 문턱값 : 상대 폭의 절반 + 자차 폭의 절반(self.width_half) + self.safety_margin
+        #              두 사각형을 원으로 근사한 것이다.
+        #   ⓑ sqrt   : 아래 주석에 제곱거리 버전이 남아 있다. 제곱을 쓰면 제약값의
+        #              단위가 m² 라 거리에 비례하지 않고, soft 벌점이 먼 거리에서
+        #              과하게 커진다. sqrt 를 써서 단위를 m 로 맞춘다.
+        #   ⓒ + eps² : sqrt 는 거리 0 에서 미분이 정의되지 않는다. eps² 를 더해
+        #              원점을 매끄럽게 만든다 (겹쳤을 때 솔버가 죽지 않도록).
+        #
+        # 채우지 않으면 제약이 항상 만족되어 충돌 회피가 사라진다. 그 상태로 §8 을
+        # 돌려 보면 상대 차량 옆을 스치듯 지나간다.
+        collision_threshold = 0.0   # TODO ⓐ
         eps = 0.01
+        loose = 0.0 * vehicle.rear_x + MPCConstants.Numerical.LARGE_POSITIVE
+
         # Constraints 1-3: Rear axle vs agent trajectory points
-        con1 = sqrt((vehicle.rear_x - agent.x1)**2 + (vehicle.rear_y - agent.y1)**2 + eps**2) - collision_threshold
-        con2 = sqrt((vehicle.rear_x - agent.x2)**2 + (vehicle.rear_y - agent.y2)**2 + eps**2) - collision_threshold
-        con3 = sqrt((vehicle.rear_x - agent.x3)**2 + (vehicle.rear_y - agent.y3)**2 + eps**2) - collision_threshold
+        con1 = loose   # TODO
+        con2 = loose   # TODO
+        con3 = loose   # TODO
 
         # Constraints 4-6: Center vs agent trajectory points
         # con4 = (vehicle.center_x - agent.x1)**2 + (vehicle.center_y - agent.y1)**2 - collision_threshold
         # con5 = (vehicle.center_x - agent.x2)**2 + (vehicle.center_y - agent.y2)**2 - collision_threshold
         # con6 = (vehicle.center_x - agent.x3)**2 + (vehicle.center_y - agent.y3)**2 - collision_threshold
 
-        con4 = sqrt((vehicle.center_x - agent.x1)**2 + (vehicle.center_y - agent.y1)**2 + eps**2) - collision_threshold
-        con5 = sqrt((vehicle.center_x - agent.x2)**2 + (vehicle.center_y - agent.y2)**2 + eps**2) - collision_threshold
-        con6 = sqrt((vehicle.center_x - agent.x3)**2 + (vehicle.center_y - agent.y3)**2 + eps**2) - collision_threshold
+        con4 = loose   # TODO
+        con5 = loose   # TODO
+        con6 = loose   # TODO
 
         # Constraints 7-9: Front vs agent trajectory points
-        # con7 = (vehicle.front_x - agent.x1)**2 + (vehicle.front_y - agent.y1)**2 - collision_threshold
-        # con8 = (vehicle.front_x - agent.x2)**2 + (vehicle.front_y - agent.y2)**2 - collision_threshold
-        # con9 = (vehicle.front_x - agent.x3)**2 + (vehicle.front_y - agent.y3)**2 - collision_threshold
-
-        con7 = sqrt((vehicle.front_x - agent.x1)**2 + (vehicle.front_y - agent.y1)**2 + eps**2) - collision_threshold
-        con8 = sqrt((vehicle.front_x - agent.x2)**2 + (vehicle.front_y - agent.y2)**2 + eps**2) - collision_threshold
-        con9 = sqrt((vehicle.front_x - agent.x3)**2 + (vehicle.front_y - agent.y3)**2 + eps**2) - collision_threshold
+        con7 = loose   # TODO
+        con8 = loose   # TODO
+        con9 = loose   # TODO
+        # ────────────────────────────────────────────────────────────────────
 
         return [con1, con2, con3, con4, con5, con6, con7, con8, con9]
 
