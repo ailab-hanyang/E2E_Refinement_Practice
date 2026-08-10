@@ -6,6 +6,12 @@ ML planner 의 출력을 **Open-loop 와 Closed-loop 양쪽으로 채점**하고
 후처리**한 효과까지 비교한다. 실습 모델은 **PLUTO** 와 **Diffusion Planner** 두 가지이며
 `model_adapter` 를 교체하여 바꾼다.
 
+## 필수 apt 패키지 다운로드
+```bash
+sudo apt update
+sudo apt install git curl
+```
+
 ## 실습 목표
 
 1. **ML Planner 를 검증하는 nuPlan framework 에 대해 이해하고, ML Planner 의 검증 방식에 대해
@@ -55,10 +61,9 @@ bash /tmp/miniconda.sh -b -p "$HOME/miniconda3" && rm -f /tmp/miniconda.sh
 
 ```bash
 sudo apt install fonts-nanum  # 그래프 라벨이 한글이라, 없으면 빈 네모로 나온다
-conda create -n e2e_refinement python=3.9.0 pip==24.0
+conda create -n e2e_refinement python=3.9.25 pip==24.0
 conda activate e2e_refinement
 conda install jupyterlab ipykernel   # 노트북 실행기 + 커널
-python -m ipykernel install --user --name e2e_refinement --display-name "E2E Refinement"
 ```
 
 커널 등록 후 노트북에서 **Kernel > Change Kernel > E2E Refinement** 를 선택한다.
