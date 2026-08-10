@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 # ---------------------------------------------------------------------------
 # 부트스트랩 — devkit 을 import 하기 전에 반드시 먼저 부른다
@@ -576,6 +576,131 @@ def scenario_video_browser(run_dir: Path, tag: str,
                    names="value")
     show(options[0][1])          # 처음부터 비어 있지 않도록 한 번 그린다
     return widgets.HBox([select, out])
+
+
+# ---------------------------------------------------------------------------
+# 모델 간 비교 — 같은 시나리오에서 두 런을 나란히 놓는다
+# ---------------------------------------------------------------------------
+
+
+def _aligned_runs(runs: Mapping[str, Path], columns: Sequence[str]):
+    """런들을 공통 시나리오로 맞춘다.
+
+    두 모델의 점수는 **같은 시나리오**에서만 비교가 성립한다. limit 이 달랐거나 한쪽에서
+    시뮬레이션이 실패해 시나리오 수가 다르면, 평균이 서로 다른 표본의 평균이 되어
+    "어느 모델이 낫다" 는 말 자체가 성립하지 않는다. Closed-loop 은 곱셈 항 하나로
+    시나리오 점수가 0 이 되므로 표본이 하나만 달라도 평균이 크게 흔들린다.
+
+    그래서 `(log_name, token)` 이 모든 런에 다 있는 시나리오만 남기고, 무엇이 빠졌는지
+    출력한다. 조용히 버리면 표가 정상으로 보인다.
+
+    :return: {이름: 공통 시나리오만 남은 표}. index 는 (log_name, token).
+    """
+    tables = {}
+    for name, run_dir in runs.items():
+        table = per_scenario_scores(run_dir, columns=columns)
+        tables[name] = table.set_index(["log_name", "token"]).sort_index()
+
+    common = None
+    for table in tables.values():
+        common = table.index if common is None else common.intersection(table.index)
+    if len(common) == 0:
+        raise ValueError(
+            "공통 시나리오가 없습니다 — 두 런이 같은 scenario_filter·limit 으로 "
+            "돌았는지 확인하십시오.")
+
+    dropped = {n: len(t) - len(common) for n, t in tables.items() if len(t) != len(common)}
+    if dropped:
+        print(f"공통 시나리오 {len(common)}건만 비교합니다 "
+              f"(제외: {', '.join(f'{n} {v}건' for n, v in dropped.items())}).")
+    return {n: t.loc[common] for n, t in tables.items()}
+
+
+def compare_scenario_scores(runs: Mapping[str, Path],
+                            columns: Optional[Sequence[str]] = None):
+    """공통 시나리오의 총점을 런별로 나란히 놓는다.
+
+    런이 둘이면 `차이` 열(뒤 - 앞)이 붙는다. 평균은 여기 넣지 않는다 — 세부 지표와
+    함께 `compare_breakdown()` 의 `score` 행에서 본다.
+
+    :param runs: {표시 이름: 런 디렉토리}. 파이썬 dict 는 넣은 순서를 지키므로
+                 표의 열 순서는 여기 적은 순서 그대로다.
+    """
+    import pandas as pd
+
+    columns = list(columns or CLOSED_BREAKDOWN)
+    tables = _aligned_runs(runs, columns)
+    names = list(runs)
+
+    out = pd.DataFrame({name: table["score"] for name, table in tables.items()})
+    out.insert(0, "scenario_type", next(iter(tables.values()))["scenario_type"])
+    if len(names) == 2:
+        out["차이"] = out[names[1]] - out[names[0]]
+    return out.reset_index().sort_values(names[0]).reset_index(drop=True)
+
+
+def compare_breakdown(runs: Mapping[str, Path],
+                      columns: Optional[Sequence[str]] = None):
+    """공통 시나리오 평균으로 세부 지표와 총점을 나란히 놓는다.
+
+    Closed-loop 지표는 대부분 시나리오마다 0/1 로 갈려서, 시나리오별 표만 봐서는
+    두 모델의 차이가 어느 항에서 왔는지 읽히지 않는다. 평균을 내야 드러난다.
+
+    :return: index 가 지표 이름이고 마지막 행이 `score`(총점 평균)인 표.
+    """
+    import pandas as pd
+
+    columns = list(columns or CLOSED_BREAKDOWN)
+    tables = _aligned_runs(runs, columns)
+    names = list(runs)
+
+    out = pd.DataFrame({name: table[[*columns, "score"]].mean()
+                        for name, table in tables.items()})
+    if len(names) == 2:
+        out["차이"] = out[names[1]] - out[names[0]]
+    return out
+
+
+def plot_breakdown_comparison(breakdown, title: Optional[str] = None,
+                              figsize=(10, 5.5)):
+    """`compare_breakdown()` 표를 가로 막대그래프로 그린다.
+
+    지표 이름이 길어 가로로 눕힌다. 곱셈 항(하나라도 0 이면 총점이 0)은 이름 앞에
+    `×` 를 붙여 가중합 항과 구분하고, 총점 행은 구분선 아래로 뗀다 — 같은 축에
+    나란히 두면 총점이 지표 하나처럼 보인다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    names = [c for c in breakdown.columns if c != "차이"]
+    rows = list(breakdown.index)
+    labels = [("× " if r in CLOSED_MULTIPLICATIVE else "   ") + r for r in rows]
+
+    y = np.arange(len(rows))
+    height = 0.8 / len(names)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for i, name in enumerate(names):
+        offset = (i - (len(names) - 1) / 2) * height
+        bars = ax.barh(y + offset, breakdown[name].to_numpy(float),
+                       height=height * 0.9, label=name)
+        ax.bar_label(bars, fmt="%.2f", fontsize=8, padding=2)
+
+    if "score" in rows:
+        ax.axhline(rows.index("score") - 0.5, color="0.5", lw=0.8)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.18)
+    ax.set_xlabel("공통 시나리오 평균 점수  (× = 곱셈 항)")
+    ax.axvline(1.0, color="0.7", lw=0.8, ls="--")
+    ax.grid(axis="x", alpha=0.3)
+    ax.legend(loc="lower right", fontsize=9)
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    return fig, ax
 
 
 # ---------------------------------------------------------------------------
