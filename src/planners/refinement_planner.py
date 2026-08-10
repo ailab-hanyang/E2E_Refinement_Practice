@@ -56,6 +56,11 @@ from src.planners.evaluator import (
     build_score_panel,
     highlight_tokens,
 )
+from src.planners.evaluator.realtime_metric_tracker import (
+    CLOSED_BREAKDOWN as EXECUTED_METRIC_NAMES,
+    RealtimeNuPlanMetricTracker,
+    score_executed_history_step,
+)
 
 from ..scenario_manager.scenario_manager import ScenarioManager
 from .ml_planner_utils import global_trajectory_to_states
@@ -189,6 +194,9 @@ class RefinementPlanner(AbstractPlanner):
             forward_simulate=score_forward_simulate,
             score_open_loop=score_open_loop,
         )
+        self._executed_metric_tracker = (
+            RealtimeNuPlanMetricTracker(scenario) if scenario is not None else None
+        )
 
         self._save_dir = save_dir
         self._csv_path: Optional[str] = None   # PID 가 필요해 initialize() 에서 정한다
@@ -224,6 +232,10 @@ class RefinementPlanner(AbstractPlanner):
 
         # 노트북에서 planner 를 재사용하면 Open-loop 누적기가 남으므로 여기서 비운다.
         self._scorer.reset_open_loop()
+        self._executed_metric_tracker = (
+            RealtimeNuPlanMetricTracker(self._scenario)
+            if self._scenario is not None else None
+        )
 
         self._scene_render = (
             OpenLoopSceneRender() if self._render_mode == "open" else EvalSceneRender()
@@ -256,6 +268,29 @@ class RefinementPlanner(AbstractPlanner):
 
         self._scenario_manager.update_ego_state(ego_state)
         self._scenario_manager.update_drivable_area_map()
+
+        # 후보 궤적을 만들기 전의 현재 상태가 실제로 실행된 Closed-loop history다.
+        # 후보 점수와 섞지 않고 step·prefix 지표로 별도 기록한다.
+        executed_metrics = None
+        if (
+            self._log_csv
+            and self._render_mode == "closed"
+            and self._executed_metric_tracker is not None
+        ):
+            try:
+                _, current_observation = current_input.history.current_state
+                executed_metrics = score_executed_history_step(
+                    tracker=self._executed_metric_tracker,
+                    ego_state=ego_state,
+                    observation=current_observation,
+                    expert_ego_state=self._scenario.get_ego_state_at_iteration(iteration),
+                    baseline_path=self._safe_baseline_path(ego_state),
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] iter=%d: 실행 history 지표 계산 실패: %s",
+                    getattr(self._scenario, "token", "?"), iteration, e,
+                )
 
         # [1] ML 추론 — 어댑터가 ego-local 궤적 하나를 만들고 global 로 변환한다.
         ao = self._adapter.build_and_forward(current_input, self._initialization)
@@ -295,7 +330,9 @@ class RefinementPlanner(AbstractPlanner):
 
         # [7] 기록 / 렌더 — CSV 한 줄과 프레임 한 장을 남긴다.
         if self._log_csv and scores:
-            self._append_csv(iteration, scores, executed, refine_reason)
+            self._append_csv(
+                iteration, scores, executed, refine_reason, executed_metrics
+            )
         if self._render and scores:
             self._render_step(
                 current_input, ml_local, sm_local, refine_local, scores,
@@ -576,11 +613,14 @@ class RefinementPlanner(AbstractPlanner):
         scores: Dict[str, TrajectoryScore],
         executed: str,
         refine_reason: Optional[str],
+        executed_metrics: Optional[Dict[str, object]] = None,
     ) -> None:
         """[7단계] 스텝마다 CSV 한 줄을 남긴다. 나중에 여러 런을 정량 비교할 근거다.
 
-        한 행에 ml_ · sm_ · rf_ 접두사로 세 궤적의 지표를 나란히 적는다. 영상은 눈으로
-        보는 용도이고, 숫자로 따지려면 이 CSV 가 필요하다.
+        한 행에 ml_ · sm_ · rf_ 접두사로 세 후보 궤적의 지표를 나란히 적는다. 이 값은
+        현재 iteration에서 아직 실행되지 않은 미래 계획의 평가다. 반면 step_ ·
+        cumulative_ 접두사는 simulator에서 실제 실행된 ego history의 순간/누적 평가다.
+        Chapter 10의 실시간 지표 timeline은 반드시 뒤의 두 접두사를 사용한다.
 
         열 구성은 **항상 세 후보 모두** 를 담는다. 필터나 MPC 가 꺼져 있으면 그쪽 칸이
         빈 값이 될 뿐이다. 런마다 열이 달라지면 여러 런의 CSV 를 이어 붙일 수 없다.
@@ -602,6 +642,24 @@ class RefinementPlanner(AbstractPlanner):
         def _delta(name: str):
             return (scores[name].final - ml_score.final) if name in scores else ""
 
+        executed_columns = (
+            ["step_final", "cumulative_final"]
+            + [f"step_{name}" for name in EXECUTED_METRIC_NAMES]
+            + [f"cumulative_{name}" for name in EXECUTED_METRIC_NAMES]
+        )
+        executed_row = {column: "" for column in executed_columns}
+        if executed_metrics is not None:
+            executed_row["step_final"] = executed_metrics["step_final"]
+            executed_row["cumulative_final"] = executed_metrics["cumulative_final"]
+            executed_row.update({
+                f"step_{name}": value
+                for name, value in executed_metrics["step"].items()
+            })
+            executed_row.update({
+                f"cumulative_{name}": value
+                for name, value in executed_metrics["cumulative"].items()
+            })
+
         with open(self._csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             if f.tell() == 0:
@@ -610,6 +668,7 @@ class RefinementPlanner(AbstractPlanner):
                      "driving_policy", "executed", "refine_reason",
                      "ml_final", "sm_final", "rf_final", "sm_delta", "delta"]
                     + [f"{name}_{k}" for name in (ML, SMOOTH, REFINE) for k in metric_keys]
+                    + executed_columns
                 )
             writer.writerow(
                 [self._scenario.log_name, self._scenario.token, iteration,
@@ -618,6 +677,7 @@ class RefinementPlanner(AbstractPlanner):
                  _delta(SMOOTH), _delta(REFINE)]
                 + [rows[name].get(k, "") for name in (ML, SMOOTH, REFINE)
                    for k in metric_keys]
+                + [executed_row[column] for column in executed_columns]
             )
 
     def _render_step(

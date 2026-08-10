@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 # ---------------------------------------------------------------------------
 # 부트스트랩 — devkit 을 import 하기 전에 반드시 먼저 부른다
@@ -362,6 +362,115 @@ CLOSED_BREAKDOWN = [
 ]
 
 
+class RealtimeNuPlanMetricTracker:
+    """실제 Closed-loop history에 같은 nuPlan metric을 매 step 적용한다.
+
+    ``update``는 두 dict를 반환한다.
+
+    - ``step``: 이번 planning timestep에서 계산된 값
+    - ``cumulative``: 현재까지 실행된 history prefix의 metric 값
+
+    노트북은 계산 순서와 시각화에 집중하고, 지표별 입력 window를 맞추는 반복 코드는
+    이 helper에 둔다. 공식 metric의 점수 함수와 threshold는 바꾸지 않는다.
+    """
+
+    def __init__(self, scenario):
+        self.scenario = scenario
+        self.ego_states = []
+        self.observations = []
+        self.expert_ego_states = []
+        self.baseline_path = None
+        self._cumulative_collision_score = 1.0
+
+    @staticmethod
+    def _metric_functions():
+        from src.planners.evaluator.evaluate_functions import (
+            score_drivable_area_compliance,
+            score_driving_direction_compliance,
+            score_ego_is_comfortable,
+            score_ego_progress,
+            score_no_ego_at_fault_collisions,
+            score_speed_limit_compliance,
+            score_time_to_collision,
+        )
+        return {
+            "collision": score_no_ego_at_fault_collisions,
+            "drivable": score_drivable_area_compliance,
+            "direction": score_driving_direction_compliance,
+            "ttc": score_time_to_collision,
+            "speed": score_speed_limit_compliance,
+            "comfort": score_ego_is_comfortable,
+            "progress": score_ego_progress,
+        }
+
+    def _values(self, *, current_step: bool):
+        fn = self._metric_functions()
+        dt = float(self.scenario.database_interval)
+
+        if current_step:
+            current_states = self.ego_states[-1:]
+            current_observations = self.observations[-1:]
+            direction_window = max(2, int(round(1.0 / dt)) + 1)
+            direction_states = self.ego_states[-direction_window:]
+            comfort_window = max(5, int(round(1.5 / dt)) + 1)
+            comfort_states = self.ego_states[-comfort_window:]
+        else:
+            current_states = self.ego_states
+            current_observations = self.observations
+            direction_states = self.ego_states
+            comfort_states = self.ego_states
+
+        collision, _ = fn["collision"](
+            self.scenario, current_states, current_observations)
+        drivable, _ = fn["drivable"](self.scenario, current_states)
+        direction, _ = fn["direction"](self.scenario, direction_states)
+        ttc, _ = fn["ttc"](self.scenario, current_states, current_observations)
+        speed, _ = fn["speed"](self.scenario, current_states)
+
+        comfort = 1.0
+        if len(comfort_states) >= 5:
+            comfort, _ = fn["comfort"](comfort_states, dt=dt)
+
+        # progress는 nuPlan 정의상 pose 하나의 값이 아니라 시작~현재 history의 진행량이다.
+        progress, making_progress, _ = fn["progress"](
+            self.ego_states, self.expert_ego_states, self.baseline_path)
+
+        return {
+            "no_ego_at_fault_collisions": float(collision),
+            "drivable_area_compliance": float(drivable),
+            "driving_direction_compliance": float(direction),
+            "ego_is_making_progress": float(making_progress),
+            "ego_progress_along_expert_route": float(progress),
+            "time_to_collision_within_bound": float(ttc),
+            "speed_limit_compliance": float(speed),
+            "ego_is_comfortable": float(comfort),
+        }
+
+    def update(self, ego_state, observation, expert_ego_state, baseline_path=None):
+        """실제 상태 하나를 추가하고 ``(step, cumulative)``을 반환한다."""
+        self.ego_states.append(ego_state)
+        self.observations.append(observation)
+        self.expert_ego_states.append(expert_ego_state)
+        if self.baseline_path is None and baseline_path is not None:
+            self.baseline_path = baseline_path
+        step = self._values(current_step=True)
+        cumulative = self._values(current_step=False)
+
+        # Collision은 최초 접촉과 과실 분류를 기억하는 이벤트 지표다. 단일 snapshot의
+        # overlap을 매번 새 충돌로 보지 않고, prefix gate가 처음 1→0이 된 step만 표시한다.
+        collision_name = "no_ego_at_fault_collisions"
+        cumulative_collision = min(
+            self._cumulative_collision_score,
+            float(cumulative[collision_name]),
+        )
+        step[collision_name] = float(
+            not (self._cumulative_collision_score > 0.0 and cumulative_collision == 0.0)
+        )
+        cumulative[collision_name] = cumulative_collision
+        self._cumulative_collision_score = cumulative_collision
+        return step, cumulative
+
+
 def load_aggregate(run_dir: Path):
     """런 디렉토리에서 가장 최근 집계 parquet 을 읽는다."""
     import pandas as pd
@@ -467,14 +576,341 @@ def verify_open_loop(run_dir: Path):
 
 
 def load_step_csv(run_dir: Path):
-    """planner 가 매 스텝 남긴 채점 CSV 를 모두 합친다 (워커 PID 마다 한 파일)."""
+    """planner 가 매 스텝 남긴 PID별 CSV를 합쳐 한 실행 timeline으로 만든다.
+
+    같은 uid로 중단 후 재실행한 폴더에는 예전 PID CSV가 남아 같은
+    ``(log_name, token, iteration)``이 중복될 수 있다. 시나리오별로 iteration이
+    가장 많이 기록된 CSV 하나를 선택하고, 길이가 같으면 수정 시각이 최신인 파일을
+    선택한다. 중복 행을 그대로 그리면 한 모델의 시간축이 앞뒤로 되감겨 다른
+    모델과 비교할 수 없다.
+    """
     import pandas as pd
 
     files = sorted(Path(run_dir).rglob("trajectory_evaluator_results/*.csv"))
-    frames = [pd.read_csv(f) for f in files if f.stat().st_size > 0]
+    frames = []
+    for path in files:
+        if path.stat().st_size == 0:
+            continue
+        frame = pd.read_csv(path)
+        frame["_csv_source"] = str(path)
+        frame["_csv_mtime_ns"] = path.stat().st_mtime_ns
+        frames.append(frame)
     if not frames:
         return None
-    return pd.concat(frames, ignore_index=True)
+
+    result = pd.concat(frames, ignore_index=True)
+    identity = [
+        column for column in ("log_name", "token", "iteration")
+        if column in result.columns
+    ]
+    if len(identity) == 3:
+        scenario_key = ["log_name", "token"]
+        source_rank = (
+            result.groupby([*scenario_key, "_csv_source"], as_index=False)
+            .agg(
+                _iteration_count=("iteration", "nunique"),
+                _source_mtime_ns=("_csv_mtime_ns", "max"),
+            )
+            .sort_values(["_iteration_count", "_source_mtime_ns"])
+            .drop_duplicates(scenario_key, keep="last")
+        )
+        chosen_sources = source_rank[[*scenario_key, "_csv_source"]]
+        result = (
+            result.merge(
+                chosen_sources,
+                on=[*scenario_key, "_csv_source"],
+                how="inner",
+                validate="many_to_one",
+            )
+            .sort_values("_csv_mtime_ns")
+            .drop_duplicates(identity, keep="last")
+            .sort_values(["token", "iteration"])
+            .reset_index(drop=True)
+        )
+    return result.drop(columns=["_csv_source", "_csv_mtime_ns"])
+
+
+def load_executed_metric_runs(
+    model_runs: Mapping[str, Path],
+    expected_adapters: Mapping[str, str],
+    metrics: Optional[Sequence[str]] = None,
+):
+    """Chapter 10의 executed-history CSV와 official 표를 model·token으로 맞춘다."""
+    import numpy as np
+    import pandas as pd
+    from omegaconf import OmegaConf
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    step_columns = [f"step_{name}" for name in metric_names]
+    cumulative_columns = [f"cumulative_{name}" for name in metric_names]
+    required = ["step_final", "cumulative_final", *step_columns, *cumulative_columns]
+    official_tables = {
+        model: per_scenario_scores(run_dir, columns=metric_names).set_index("token")
+        for model, run_dir in model_runs.items()
+    }
+
+    step_runs = {}
+    for model, run_dir in model_runs.items():
+        cfg = OmegaConf.load(Path(run_dir) / "code/hydra/config.yaml")
+        adapter = str(cfg.planner.refinement_planner.model_adapter._target_)
+        expected = expected_adapters[model]
+        if not adapter.endswith(expected):
+            raise AssertionError(f"{model} adapter가 아닙니다: {adapter}")
+
+        frame = load_step_csv(run_dir)
+        if frame is None:
+            raise FileNotFoundError(f"{model} timestep CSV가 없습니다.")
+        missing = [column for column in required if column not in frame]
+        if missing:
+            raise KeyError(
+                f"{model} 결과는 이전 CSV 스키마입니다. 10.1을 다시 실행하십시오. "
+                f"누락 열 예: {missing[:3]}"
+            )
+        empty = [column for column in required if frame[column].isna().all()]
+        if empty:
+            raise ValueError(
+                f"{model} executed-history 계산이 실패했습니다. 빈 열: {empty[:3]}"
+            )
+
+        frame = frame.drop_duplicates(
+            ["log_name", "token", "iteration"], keep="last"
+        ).copy()
+        frame.insert(0, "model", model)
+        official = official_tables[model]
+        unknown = sorted(set(frame["token"]) - set(official.index))
+        if unknown:
+            raise KeyError(f"공식 결과가 없는 token: {unknown}")
+        frame["official_final"] = frame["token"].map(official["score"])
+        frame["official_collision"] = frame["token"].map(
+            official["no_ego_at_fault_collisions"]
+        )
+        # v2 CSV의 step collision은 매 snapshot에서 collision history를 초기화해
+        # 지속 overlap을 새 충돌로 오인할 수 있었다. 두 모델 모두 official과 같은
+        # history-prefix 판정을 기준으로 삼고, 최초 1→0 전환만 step event로 복원한다.
+        original_step_collision = frame["step_no_ego_at_fault_collisions"].copy()
+        corrected_groups = []
+        for _, group in frame.groupby(["log_name", "token"], sort=False):
+            group = group.sort_values("iteration").copy()
+            cumulative_name = "cumulative_no_ego_at_fault_collisions"
+            cumulative_collision = group[cumulative_name].astype(float).cummin()
+            previous_collision = cumulative_collision.shift(fill_value=1.0)
+            new_at_fault_event = (previous_collision > 0.0) & (cumulative_collision <= 0.0)
+            group[cumulative_name] = cumulative_collision
+            group["step_no_ego_at_fault_collisions"] = np.where(
+                new_at_fault_event, 0.0, 1.0
+            )
+            corrected_groups.append(group)
+        frame = pd.concat(corrected_groups, ignore_index=True)
+
+        # collision gate가 바뀐 만큼 step final도 같은 곱셈·가중평균 식으로 다시 계산한다.
+        total_weight = float(sum(CLOSED_WEIGHTS.values()))
+        frame["step_final"] = frame.apply(
+            lambda row: float(np.prod([
+                row[f"step_{name}"] for name in CLOSED_MULTIPLICATIVE
+            ])) * float(sum(
+                weight * row[f"step_{name}"]
+                for name, weight in CLOSED_WEIGHTS.items()
+            )) / total_weight,
+            axis=1,
+        )
+        corrected_count = int(np.sum(~np.isclose(
+            original_step_collision.to_numpy(dtype=float),
+            frame["step_no_ego_at_fault_collisions"].to_numpy(dtype=float),
+        )))
+        if corrected_count:
+            print(f"{model:9s} | legacy step collision {corrected_count}개 자동 보정")
+        invalid = np.isclose(frame["official_collision"], 0.0) & ~np.isclose(
+            frame["official_final"], 0.0
+        )
+        if invalid.any():
+            raise AssertionError(
+                "ego-at-fault collision=0인데 official final이 0이 아닙니다."
+            )
+
+        step_runs[model] = frame
+        print(
+            f"{model:9s} | {adapter.rsplit('.', 1)[-1]:21s} | "
+            f"{frame['token'].nunique()} scenarios, {len(frame)} executed timesteps"
+        )
+    return step_runs, official_tables
+
+
+def summarize_executed_metric_runs(
+    step_runs: Mapping[str, object],
+    metrics: Optional[Sequence[str]] = None,
+    dt_s: float = 0.1,
+):
+    """모델·시나리오별 대표 저하 시점과 공통 비교 token을 고른다."""
+    import pandas as pd
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    gate_names = list(CLOSED_MULTIPLICATIVE)
+    alert_rows = []
+    for model, frame in step_runs.items():
+        for token, group in frame.groupby("token"):
+            rows = (
+                group.sort_values("iteration")
+                .drop_duplicates("iteration", keep="last")
+                .reset_index(drop=True)
+            )
+            first_iteration = int(rows["iteration"].iloc[0])
+            failed_gate = rows[
+                [f"cumulative_{name}" for name in gate_names]
+            ].lt(1.0 - 1e-9).any(axis=1)
+            if failed_gate.any():
+                row = rows.loc[failed_gate].iloc[0]
+                selection = "first executed-history gate failure"
+            else:
+                drops = rows["cumulative_final"].diff()
+                if drops.notna().any() and float(drops.min()) < -1e-9:
+                    row = rows.loc[drops.idxmin()]
+                    selection = f"largest cumulative drop ({float(drops.min()):.3f})"
+                else:
+                    row = rows.loc[rows["cumulative_final"].idxmin()]
+                    selection = "minimum cumulative score"
+
+            step_degraded = [
+                name for name in metric_names
+                if float(row[f"step_{name}"]) < 1.0 - 1e-9
+            ]
+            cumulative_degraded = [
+                name for name in metric_names
+                if float(row[f"cumulative_{name}"]) < 1.0 - 1e-9
+            ]
+            alert_rows.append({
+                "model": model,
+                "token": token,
+                "iteration": int(row["iteration"]),
+                "time_s": (int(row["iteration"]) - first_iteration) * dt_s,
+                "online_cumulative": float(row["cumulative_final"]),
+                "official_collision": float(row["official_collision"]),
+                "official_final": float(row["official_final"]),
+                "selection": selection,
+                "step_degraded": " | ".join(step_degraded),
+                "cumulative_degraded": " | ".join(cumulative_degraded),
+            })
+
+    alerts = pd.DataFrame(alert_rows).sort_values(
+        ["official_final", "time_s", "model"]
+    ).reset_index(drop=True)
+    common_tokens = sorted(set.intersection(
+        *[set(frame["token"]) for frame in step_runs.values()]
+    ))
+    if not common_tokens:
+        raise ValueError("두 모델의 CSV에 공통 token이 없습니다.")
+    token_rank = (
+        alerts[alerts["token"].isin(common_tokens)]
+        .groupby("token")["official_final"].min().sort_values()
+    )
+    return alerts, common_tokens, str(token_rank.index[0])
+
+
+def plot_executed_metric_timeline(
+    rows,
+    title: str,
+    metrics: Optional[Sequence[str]] = None,
+    dt_s: float = 0.1,
+):
+    """누적 final과 실제 step·prefix 지표를 같은 iteration 축에 그린다."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    step_columns = [f"step_{name}" for name in metric_names]
+    cumulative_columns = [f"cumulative_{name}" for name in metric_names]
+    rows = rows.sort_values("iteration").reset_index(drop=True)
+    iterations = rows["iteration"].to_numpy(dtype=float)
+    edges = np.concatenate([iterations, [iterations[-1] + 1]])
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(13, 9), sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 2.1, 2.1]},
+    )
+    axes[0].plot(iterations, rows["cumulative_final"], "o-", ms=3, lw=1.8,
+                 label="online cumulative final")
+    official_final = float(rows["official_final"].iloc[0])
+    axes[0].axhline(official_final, color="black", ls=":", alpha=.7,
+                    label=f"official scenario final = {official_final:.3f}")
+    axes[0].set(ylabel="score", ylim=(-0.05, 1.05),
+                title=f"{title} — actual executed-history metrics")
+    axes[0].grid(alpha=.3); axes[0].legend(loc="lower left", fontsize=8)
+
+    for axis, columns, panel_title in (
+        (axes[1], step_columns, "Per-timestep metrics (step_*)"),
+        (axes[2], cumulative_columns, "History-prefix metrics (cumulative_*)"),
+    ):
+        image = axis.pcolormesh(
+            edges, np.arange(len(columns) + 1),
+            rows[columns].to_numpy(dtype=float).T,
+            shading="flat", vmin=0, vmax=1, cmap="RdYlGn",
+        )
+        axis.set_ylim(len(columns), 0)
+        axis.set_yticks(np.arange(len(columns)) + .5)
+        axis.set_yticklabels(metric_names, fontsize=8)
+        axis.set_title(panel_title)
+        fig.colorbar(image, ax=axis, label="metric value", pad=.01)
+    axes[2].set_xlabel(f"simulation iteration  (1 step = {dt_s:g} s)")
+    fig.tight_layout()
+    return fig
+
+
+def show_executed_metric_analysis(
+    step_runs: Mapping[str, object],
+    alerts,
+    token: str,
+    metrics: Optional[Sequence[str]] = None,
+    dt_s: float = 0.1,
+) -> None:
+    """대표 시점 전후 표와 전체 executed-history timeline을 모델별로 출력한다."""
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    for model, frame in step_runs.items():
+        selected = frame[frame["token"] == token].sort_values("iteration").copy()
+        selected["time_s"] = (
+            selected["iteration"] - selected["iteration"].iloc[0]
+        ) * dt_s
+        alert = alerts[
+            (alerts["model"] == model) & (alerts["token"] == token)
+        ].iloc[0]
+        center = int(alert["iteration"])
+        window = selected[selected["iteration"].between(center - 3, center + 3)]
+        degraded = {
+            name
+            for column in ("step_degraded", "cumulative_degraded")
+            for name in str(alert[column]).split(" | ")
+            if name
+        }
+        detail_names = [name for name in metric_names if name in degraded]
+        detail_columns = [
+            column
+            for name in detail_names
+            for column in (f"step_{name}", f"cumulative_{name}")
+        ]
+        show_columns = [
+            "model", "token", "iteration", "time_s", "step_final",
+            "cumulative_final", "official_collision", "official_final",
+            *detail_columns,
+        ]
+
+        section(
+            f"{model} | {alert['selection']} | "
+            f"iter={center}, t={alert['time_s']:.1f}s"
+        )
+        print("현재 timestep 저하:", alert["step_degraded"] or "없음")
+        print("누적 history 저하:", alert["cumulative_degraded"] or "없음")
+        print(
+            f"official collision={alert['official_collision']:.3f} | "
+            f"official final={alert['official_final']:.3f}"
+        )
+        display(window[show_columns].round(3))
+        fig = plot_executed_metric_timeline(
+            selected, f"{model} — {token[:8]}", metric_names, dt_s
+        )
+        for axis in fig.axes[:3]:
+            axis.axvline(center, color="red", ls="--", alpha=.7)
+        plt.show()
 
 
 def runner_status(run_dir: Path):
@@ -576,6 +1012,525 @@ def scenario_video_browser(run_dir: Path, tag: str,
                    names="value")
     show(options[0][1])          # 처음부터 비어 있지 않도록 한 번 그린다
     return widgets.HBox([select, out])
+
+
+# ---------------------------------------------------------------------------
+# PLUTO — 후보 궤적과 학습 점수
+# ---------------------------------------------------------------------------
+
+
+def capture_pluto_candidates(adapter, planner_input, initialization, top_k: int = 10):
+    """PLUTO 가 한 번의 forward 로 내놓는 **후보 궤적과 점수**를 상위 top_k 개만 꺼낸다.
+
+    어댑터는 `out["output_trajectory"]` 하나만 꺼내고 후보와 점수는 버린다
+    (`pluto_adapter.py` 의 `build_and_forward`). 후보를 보려면 모델 forward 를 직접 부른다 —
+    Diffusion 과 달리 monkey-patch 는 필요 없다. 이미 반환 dict 에 들어 있다.
+
+    `probability` 는 **reference line 이 패딩된 자리를 `-1e6` 으로 채워** 둔다
+    (`pluto_model.py` 의 `masked_fill_`). 거르지 않으면 유효한 후보들이 색 하나로 뭉갠다.
+
+    :return: `(candidates, scores, data)` — 점수 내림차순. `candidates` 는 `(K, 80, 3)`
+             `[x, y, yaw]` ego-local 이고 `candidates[0]` 이 곧 `AdapterOutput.ml_local` 이다.
+             `data` 는 지도를 그릴 때 쓰는 모델 입력 dict 다.
+    """
+    import torch
+
+    feature = adapter._feature_builder.get_features_from_simulation(
+        planner_input, initialization)
+    data = feature.collate([feature.to_feature_tensor()]).to_device(adapter._device).data
+    with torch.no_grad():
+        out = adapter._planner.forward(data)
+
+    candidates = out["candidate_trajectories"][0]        # (R, M, T, 3)
+    scores = out["probability"][0]                       # (R, M)
+    if candidates.numel() == 0:
+        raise RuntimeError(
+            "후보가 없습니다 — reference line 이 만들어지지 않았습니다. "
+            "build_reference_line=True 인지 확인하십시오.")
+
+    flat_traj = candidates.reshape(-1, candidates.shape[-2], candidates.shape[-1])
+    flat_score = scores.reshape(-1)
+    keep = flat_score > -1e5                             # 패딩 자리를 뗀다
+    flat_traj, flat_score = flat_traj[keep], flat_score[keep]
+
+    order = torch.argsort(flat_score, descending=True)[:top_k]
+    return (flat_traj[order].cpu().numpy(), flat_score[order].cpu().numpy(), data)
+
+
+def _plot_pluto_map(ax, data, alpha: float = 1.0):
+    """PLUTO 피처의 지도를 배경으로 깐다. `point_position` 은
+    `[구간, {중심, 좌경계, 우경계}, 20, xy]` 구조다."""
+    import numpy as np
+
+    def numpy_of(value):
+        return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+    points = numpy_of(data["map"]["point_position"])[0]          # (M, 3, P, 2)
+    on_route = numpy_of(data["map"].get("polygon_on_route", np.zeros(len(points))))
+    on_route = on_route[0] if on_route.ndim > 1 else on_route
+
+    for idx, segment in enumerate(points):
+        routed = bool(on_route[idx]) if idx < len(on_route) else False
+        ax.plot(*segment[0].T, color=_SCENE_COLOURS["route" if routed else "lane"],
+                lw=1.6 if routed else 0.9, ls="-" if routed else (0, (4, 3)),
+                alpha=(0.9 if routed else 1.0) * alpha, zorder=1)
+        for boundary in segment[1:]:
+            ax.plot(*boundary.T, color=_SCENE_COLOURS["boundary"], lw=0.8, alpha=alpha,
+                    zorder=1)
+
+    ax.plot(*_rotated_box(0, 0, 0, 2.297, 5.176).T,
+            color=_SCENE_COLOURS["ego"], lw=2.0, alpha=alpha, zorder=5)
+    return ax
+
+
+def plot_pluto_candidates(candidates, scores, data=None, axes=None, figsize=(13, 4.6),
+                          cmap: str = "Blues", dt: float = 0.1):
+    """후보 궤적을 **학습 점수로 칠하고 점수 순으로 겹쳐** 그린다.
+
+    색과 zorder 가 같은 것(점수)을 나타내므로, 최우선 후보가 가장 진하면서 맨 위에 온다.
+    점수는 순서가 있는 양이라 한 색상의 밝기 단계만 쓰고 색막대를 붙인다.
+
+    패널이 둘인 이유 — 후보는 `Q_lat × Q_lon` 격자라 **횡방향으로도 종방향으로도** 갈리는데,
+    조감도는 앞의 것만 보여 준다. 직진 장면에서는 후보가 전부 같은 차선 위에 겹쳐 한 줄로
+    보이며, 실제 차이는 "얼마나 멀리 가는가"에 있다. 오른쪽 패널이 그것을 편다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=figsize,
+                               gridspec_kw={"width_ratios": [1.55, 1]})
+    ax_map, ax_lon = axes
+    if data is not None:
+        _plot_pluto_map(ax_map, data)
+
+    lo, hi = float(np.min(scores)), float(np.max(scores))
+    norm = Normalize(lo, hi if hi > lo else lo + 1e-6)
+    colours = plt.get_cmap(cmap)(np.linspace(0.28, 1.0, len(scores)))
+
+    travel = np.concatenate(
+        [np.zeros((len(candidates), 1)),
+         np.cumsum(np.linalg.norm(np.diff(candidates[:, :, :2], axis=1), axis=-1), axis=1)],
+        axis=1)
+    t = np.arange(candidates.shape[1]) * dt
+
+    # 점수가 낮은 것부터 그려 높은 것이 위로 오게 한다.
+    for rank in range(len(candidates) - 1, -1, -1):
+        colour = colours[len(scores) - 1 - rank]
+        width = 2.8 if rank == 0 else 1.4
+        order = 10 + (len(scores) - rank)
+        ax_map.plot(candidates[rank][:, 0], candidates[rank][:, 1], color=colour,
+                    lw=width, zorder=order, solid_capstyle="round")
+        ax_lon.plot(t, travel[rank], color=colour, lw=width, zorder=order)
+
+    ax_map.annotate(f"1위 = ml_local  (점수 {scores[0]:.2f})", candidates[0][-1, :2],
+                    fontsize=9, fontweight="bold", xytext=(-6, 8), ha="right",
+                    textcoords="offset points", color=colours[-1], zorder=30)
+    ax_lon.annotate(f"1위  {travel[0][-1]:.0f} m", (t[-1], travel[0][-1]),
+                    fontsize=9, fontweight="bold", xytext=(-4, 6),
+                    textcoords="offset points", ha="right", color=colours[-1], zorder=30)
+
+    # 지도는 반경 120 m 라 그대로 두면 후보가 화면 한가운데 뭉갠다. 후보 범위로 맞춘다.
+    points = candidates[:, :, :2].reshape(-1, 2)
+    margin = 12.0
+    ax_map.set_xlim(points[:, 0].min() - margin, points[:, 0].max() + margin)
+    ax_map.set_ylim(points[:, 1].min() - margin, points[:, 1].max() + margin)
+    ax_map.set_aspect("equal")
+    ax_map.set_xlabel("x [m]  (자차 진행 방향)")
+    ax_map.set_ylabel("y [m]")
+    ax_map.set_title("경로 — 횡방향 후보", fontsize=10)
+    ax_map.grid(alpha=0.15)
+
+    ax_lon.set_xlabel("t [s]")
+    ax_lon.set_ylabel("주행 거리 [m]")
+    ax_lon.set_title("진행 거리 — 종방향 후보", fontsize=10)
+    ax_lon.grid(alpha=0.25)
+
+    bar = ax_lon.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax_lon,
+                                 fraction=0.04, pad=0.02)
+    bar.set_label("학습 점수 (logit)")
+    ax_lon.figure.tight_layout()
+    return axes
+
+
+# ---------------------------------------------------------------------------
+# Diffusion — 입력 씬과 denoising 과정
+# ---------------------------------------------------------------------------
+
+
+def diffusion_scene_inputs(adapter, planner_input) -> Dict[str, "np.ndarray"]:
+    """Diffusion 이 **실제로 보는** 입력을 정규화 전 상태로 꺼낸다.
+
+    `DiffusionModelAdapter.build_and_forward` 는 이 dict 를 만든 직후
+    `observation_normalizer` 를 통과시키므로, 모델에 들어가는 값은 무차원이다.
+    그림으로 확인하려면 정규화 전 값이 필요해서 같은 호출을 한 번 더 한다.
+
+    :return: {키: (배치 차원 제거된) numpy}. 좌표는 **ego rear-axle 기준 미터**이며,
+             `AdapterOutput.ml_local` 및 denoising 중간 궤적과 같은 좌표계다.
+
+    채널 배치는 실제 텐서로 확인한 것이다.
+
+        neighbor_agents_past  (32, 21, 11)  [x, y, cos, sin, vx, vy, 폭, 길이, onehot(차·보행자·자전거)]
+        static_objects        (5, 10)       [x, y, cos, sin, 폭, 길이, onehot(4종)]
+        lanes                 (70, 20, 12)  [x, y, dx, dy, 좌경계offset(2), 우경계offset(2), 신호onehot(4)]
+        route_lanes           (25, 20, 12)  lanes 와 같은 채널, 주행 경로에 속한 것만
+
+    유효/패딩 마스크는 따로 없다 — **전 채널이 0 인 행이 패딩**이며 모델도 같은 규칙을 쓴다.
+    """
+    inputs = adapter._data_processor.observation_adapter(
+        planner_input.history,
+        list(planner_input.traffic_light_data),
+        adapter._map_api,
+        adapter._route_roadblock_ids,
+        adapter._device_str,
+    )
+    return {k: v.detach().cpu().numpy()[0] for k, v in inputs.items()}
+
+
+def capture_denoising_steps(adapter, planner_input, initialization, seed: Optional[int] = 0):
+    """denoising 매 단계의 중간 궤적을 모은다.
+
+    Diffusion 은 잡음에서 시작해 여러 단계를 거쳐 궤적을 복원한다. 그 중간값은 평소
+    밖으로 나오지 않지만, 샘플러가 이미 돌려줄 수 있게 되어 있다 —
+    `DPM_Solver.sample(..., return_intermediate=True)` 가 단계마다 `x_t` 를 모아 준다.
+    `dpm_sampler` 는 그 인자를 `sample_params` 로 그대로 통과시키는데, 호출부인
+    `decoder.py` 가 넘기지 않을 뿐이다.
+
+    그래서 **모델 코드를 고치지 않고** `decoder` 모듈에 바인딩된 `dpm_sampler` 이름만
+    잠시 감싼다(`from ... import dpm_sampler` 로 모듈 전역에 붙어 있어 속성 교체가 먹는다).
+    감싼 함수는 반드시 `x0` **하나만** 돌려줘야 한다 — 호출부가 튜플을 받을 준비가 없다.
+
+    :param seed: `DIFFUSION_EVAL_SEED`. 초기 잡음이 고정되어 다시 돌려도 같은 그림이 나온다.
+                 None 이면 건드리지 않는다.
+    :return: `(steps, out)`. `steps` 는 `(K, 80, 3)` = `[x, y, yaw]` ego-local numpy 이고
+             마지막 원소가 `out.ml_local` 과 같다.
+    """
+    import numpy as np
+    import torch
+
+    import diffusion_planner.model.module.decoder as decoder_module
+
+    original = decoder_module.dpm_sampler
+    captured: List["torch.Tensor"] = []
+
+    def capturing_sampler(model, x_T, **kwargs):
+        kwargs["sample_params"] = {**kwargs.get("sample_params", {}),
+                                   "return_intermediate": True}
+        x0, intermediates = original(model, x_T, **kwargs)
+        # correcting_xt_fn(initial_state_constraint) 이 xt 를 in-place 로 고친다.
+        # 복사하지 않으면 뒤 단계가 앞 단계 텐서를 덮어쓴다.
+        captured.extend(t.detach().clone() for t in intermediates)
+        return x0
+
+    previous = os.environ.get("DIFFUSION_EVAL_SEED")
+    decoder_module.dpm_sampler = capturing_sampler
+    if seed is not None:
+        os.environ["DIFFUSION_EVAL_SEED"] = str(seed)
+    try:
+        out = adapter.build_and_forward(planner_input, initialization)
+    finally:
+        decoder_module.dpm_sampler = original
+        if seed is not None:
+            if previous is None:
+                os.environ.pop("DIFFUSION_EVAL_SEED", None)
+            else:
+                os.environ["DIFFUSION_EVAL_SEED"] = previous
+
+    if not captured:
+        raise RuntimeError(
+            "중간값을 하나도 잡지 못했습니다 — 어댑터가 Diffusion 이 맞는지 확인하십시오.")
+
+    # 모델이 내놓는 것은 정규화된 값이다. decoder 가 마지막에 하는 것과 똑같이 되돌린다.
+    normalizer = adapter._config.state_normalizer
+    steps = []
+    for x_t in captured:
+        batch, agents = x_t.shape[0], x_t.shape[1]
+        denorm = normalizer.inverse(x_t.reshape(batch, agents, -1, 4))
+        ego = denorm[0, 0, 1:]                      # 0번 칸은 현재 상태 앵커라 뗀다
+        yaw = torch.atan2(ego[:, 3], ego[:, 2])
+        steps.append(torch.stack([ego[:, 0], ego[:, 1], yaw], dim=-1).cpu().numpy())
+    return np.stack(steps), out
+
+
+#: 씬 배경은 궤적을 읽는 데 방해가 되면 안 된다. 전부 무채색으로 뒤로 물린다.
+_SCENE_COLOURS = dict(lane="0.82", boundary="0.90", route="0.55",
+                      agent="0.62", static="0.72", ego="#d95f02")
+
+
+def _rotated_box(x, y, yaw, width, length):
+    """중심·헤딩·크기로 사각형 네 꼭짓점을 만든다 (닫힌 5점)."""
+    import numpy as np
+
+    half = np.array([[length / 2, width / 2], [length / 2, -width / 2],
+                     [-length / 2, -width / 2], [-length / 2, width / 2],
+                     [length / 2, width / 2]])
+    rot = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+    return half @ rot.T + np.array([x, y])
+
+
+def plot_diffusion_scene(scene, ax=None, figsize=(11, 6), show_boundary: bool = True,
+                         alpha: float = 1.0, labels: bool = True):
+    """Diffusion 입력 네 갈래를 ego-local 좌표에 그린다.
+
+    노트북 4 절 머리말 그림의 *Scenario Inputs* 네 갈래와 1:1 로 대응한다 —
+    Lanes · Navigation(route) · Neighbors · Static Obj. 궤적을 겹쳐 그릴 배경이므로
+    전부 무채색으로 뒤로 물리고, 자차만 색을 준다.
+
+    :param alpha: 배경으로 깔 때 더 흐리게 하려면 낮춘다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    for lane in scene["lanes"]:
+        pts = lane[np.abs(lane[:, :2]).sum(-1) > 0]      # 0 패딩 제거
+        if len(pts) < 2:
+            continue
+        if show_boundary:
+            ax.plot(*(pts[:, :2] + pts[:, 4:6]).T, color=_SCENE_COLOURS["boundary"],
+                    lw=0.8, alpha=alpha)
+            ax.plot(*(pts[:, :2] + pts[:, 6:8]).T, color=_SCENE_COLOURS["boundary"],
+                    lw=0.8, alpha=alpha)
+        ax.plot(*pts[:, :2].T, color=_SCENE_COLOURS["lane"], lw=0.9,
+                ls=(0, (4, 3)), alpha=alpha)
+
+    for lane in scene["route_lanes"]:
+        pts = lane[np.abs(lane[:, :2]).sum(-1) > 0]
+        if len(pts) >= 2:
+            ax.plot(*pts[:, :2].T, color=_SCENE_COLOURS["route"], lw=2.2, alpha=0.9 * alpha)
+
+    agents = scene["neighbor_agents_past"][:, -1, :]      # 현재 프레임만
+    for a in agents[np.abs(agents[:, :4]).sum(-1) > 0]:
+        box = _rotated_box(a[0], a[1], np.arctan2(a[3], a[2]), a[6], a[7])
+        ax.plot(*box.T, color=_SCENE_COLOURS["agent"], lw=1.1, alpha=alpha)
+
+    static = scene["static_objects"]
+    for s in static[np.abs(static[:, :4]).sum(-1) > 0]:
+        box = _rotated_box(s[0], s[1], np.arctan2(s[3], s[2]), s[4], s[5])
+        ax.fill(*box.T, color=_SCENE_COLOURS["static"], lw=0, alpha=alpha)
+
+    ax.plot(*_rotated_box(0, 0, 0, 2.297, 5.176).T,
+            color=_SCENE_COLOURS["ego"], lw=2.0, alpha=alpha, zorder=5)
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.15 * alpha)
+    if labels:
+        ax.set_xlabel("x [m]  (자차 진행 방향)")
+        ax.set_ylabel("y [m]")
+    return ax
+
+
+def plot_denoising_steps(steps, scene=None, ncols: int = 4, panel: float = 3.0,
+                         cmap: str = "Blues"):
+    """denoising 단계별 중간 궤적을 **단계마다 한 칸씩** 그린다.
+
+    12 개를 한 축에 겹치면 초반 잡음이 화면을 덮어 아무것도 읽히지 않는다. 칸을 나누면
+    "잡음이 접혀 들어가 궤적이 된다" 는 과정이 순서대로 보인다. 모든 칸이 같은 축 범위를
+    쓰므로 칸끼리 크기를 그대로 비교할 수 있다.
+
+    색은 단계 **순서**를 나타내는 양이라 한 색상의 밝기 단계(연함 → 진함)만 쓴다.
+    순서를 읽는 것은 칸 제목이므로 색에만 기대지 않는다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n = len(steps)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(panel * ncols, panel * nrows * 0.78),
+                             squeeze=False)
+    shades = plt.get_cmap(cmap)(np.linspace(0.35, 1.0, n))
+
+    pts = steps[:, :, :2].reshape(-1, 2)
+    pad = 8.0
+    xlim = (pts[:, 0].min() - pad, pts[:, 0].max() + pad)
+    ylim = (pts[:, 1].min() - pad, pts[:, 1].max() + pad)
+
+    for k in range(nrows * ncols):
+        ax = axes[k // ncols][k % ncols]
+        if k >= n:
+            ax.axis("off")
+            continue
+        if scene is not None:
+            plot_diffusion_scene(scene, ax=ax, show_boundary=False,
+                                 alpha=0.55, labels=False)
+        ax.plot(steps[k][:, 0], steps[k][:, 1], color=shades[k],
+                lw=2.4 if k == n - 1 else 1.6, solid_capstyle="round", zorder=10)
+        note = "  ← 잡음" if k == 0 else ("  ← ml_local" if k == n - 1 else "")
+        ax.set_title(f"step {k}{note}", fontsize=9,
+                     fontweight="bold" if k in (0, n - 1) else "normal")
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_denoising_convergence(steps, axes=None, figsize=(11, 3.6)):
+    """단계가 진행되며 궤적이 어떻게 정리되는지 두 값으로 본다.
+
+    두 값은 단위와 크기가 달라 한 축에 겹치지 않고 패널을 나눈다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.ticker import FuncFormatter
+
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=figsize)
+
+    length = np.linalg.norm(np.diff(steps[:, :, :2], axis=1), axis=-1).sum(-1)
+    shift = np.r_[np.nan, np.linalg.norm(np.diff(steps[:, :, :2], axis=0),
+                                         axis=-1).mean(-1)]
+    k = np.arange(len(steps))
+
+    for ax, value, title, unit in (
+            (axes[0], length, "궤적의 경로 길이", "m"),
+            (axes[1], shift, "직전 단계 대비 평균 이동량", "m")):
+        ax.plot(k, value, color="#1f6fb4", lw=2.0, marker="o", ms=4)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("denoising 단계")
+        ax.set_ylabel(f"[{unit}]")
+        ax.grid(alpha=0.25)
+
+    # 로그축의 기본 눈금 라벨은 mathtext(10^{-1})라 유니코드 마이너스를 쓴다. 한글 폰트에는
+    # 그 글리프가 없어 네모로 나오므로, 평범한 숫자로 찍는다.
+    axes[1].set_yscale("log")
+    axes[1].yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    axes[1].yaxis.set_minor_formatter(FuncFormatter(lambda v, _: ""))
+    return axes
+
+
+# ---------------------------------------------------------------------------
+# 모델 간 비교 — 같은 시나리오에서 두 런을 나란히 놓는다
+# ---------------------------------------------------------------------------
+
+
+def _aligned_runs(runs: Mapping[str, Path], columns: Sequence[str]):
+    """런들을 공통 시나리오로 맞춘다.
+
+    두 모델의 점수는 **같은 시나리오**에서만 비교가 성립한다. limit 이 달랐거나 한쪽에서
+    시뮬레이션이 실패해 시나리오 수가 다르면, 평균이 서로 다른 표본의 평균이 되어
+    "어느 모델이 낫다" 는 말 자체가 성립하지 않는다. Closed-loop 은 곱셈 항 하나로
+    시나리오 점수가 0 이 되므로 표본이 하나만 달라도 평균이 크게 흔들린다.
+
+    그래서 `(log_name, token)` 이 모든 런에 다 있는 시나리오만 남기고, 무엇이 빠졌는지
+    출력한다. 조용히 버리면 표가 정상으로 보인다.
+
+    :return: {이름: 공통 시나리오만 남은 표}. index 는 (log_name, token).
+    """
+    tables = {}
+    for name, run_dir in runs.items():
+        table = per_scenario_scores(run_dir, columns=columns)
+        tables[name] = table.set_index(["log_name", "token"]).sort_index()
+
+    common = None
+    for table in tables.values():
+        common = table.index if common is None else common.intersection(table.index)
+    if len(common) == 0:
+        raise ValueError(
+            "공통 시나리오가 없습니다 — 두 런이 같은 scenario_filter·limit 으로 "
+            "돌았는지 확인하십시오.")
+
+    dropped = {n: len(t) - len(common) for n, t in tables.items() if len(t) != len(common)}
+    if dropped:
+        print(f"공통 시나리오 {len(common)}건만 비교합니다 "
+              f"(제외: {', '.join(f'{n} {v}건' for n, v in dropped.items())}).")
+    return {n: t.loc[common] for n, t in tables.items()}
+
+
+def compare_scenario_scores(runs: Mapping[str, Path],
+                            columns: Optional[Sequence[str]] = None):
+    """공통 시나리오의 총점을 런별로 나란히 놓는다.
+
+    런이 둘이면 `차이` 열(뒤 - 앞)이 붙는다. 평균은 여기 넣지 않는다 — 세부 지표와
+    함께 `compare_breakdown()` 의 `score` 행에서 본다.
+
+    :param runs: {표시 이름: 런 디렉토리}. 파이썬 dict 는 넣은 순서를 지키므로
+                 표의 열 순서는 여기 적은 순서 그대로다.
+    """
+    import pandas as pd
+
+    columns = list(columns or CLOSED_BREAKDOWN)
+    tables = _aligned_runs(runs, columns)
+    names = list(runs)
+
+    out = pd.DataFrame({name: table["score"] for name, table in tables.items()})
+    out.insert(0, "scenario_type", next(iter(tables.values()))["scenario_type"])
+    if len(names) == 2:
+        out["차이"] = out[names[1]] - out[names[0]]
+    return out.reset_index().sort_values(names[0]).reset_index(drop=True)
+
+
+def compare_breakdown(runs: Mapping[str, Path],
+                      columns: Optional[Sequence[str]] = None):
+    """공통 시나리오 평균으로 세부 지표와 총점을 나란히 놓는다.
+
+    Closed-loop 지표는 대부분 시나리오마다 0/1 로 갈려서, 시나리오별 표만 봐서는
+    두 모델의 차이가 어느 항에서 왔는지 읽히지 않는다. 평균을 내야 드러난다.
+
+    :return: index 가 지표 이름이고 마지막 행이 `score`(총점 평균)인 표.
+    """
+    import pandas as pd
+
+    columns = list(columns or CLOSED_BREAKDOWN)
+    tables = _aligned_runs(runs, columns)
+    names = list(runs)
+
+    out = pd.DataFrame({name: table[[*columns, "score"]].mean()
+                        for name, table in tables.items()})
+    if len(names) == 2:
+        out["차이"] = out[names[1]] - out[names[0]]
+    return out
+
+
+def plot_breakdown_comparison(breakdown, title: Optional[str] = None,
+                              figsize=(10, 5.5)):
+    """`compare_breakdown()` 표를 가로 막대그래프로 그린다.
+
+    지표 이름이 길어 가로로 눕힌다. Closed-loop 곱셈 항이 포함된 표에서는 이름 앞에
+    `×` 를 붙여 가중합 항과 구분한다. Open-loop 표에는 해당 표시를 붙이지 않는다.
+    총점 행은 구분선 아래로 뗀다 — 같은 축에 나란히 두면 총점이 지표 하나처럼 보인다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    names = [c for c in breakdown.columns if c != "차이"]
+    rows = list(breakdown.index)
+    has_multiplicative = any(r in CLOSED_MULTIPLICATIVE for r in rows)
+    labels = [("× " if r in CLOSED_MULTIPLICATIVE else "   ") + r for r in rows]
+
+    y = np.arange(len(rows))
+    height = 0.8 / len(names)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for i, name in enumerate(names):
+        offset = (i - (len(names) - 1) / 2) * height
+        bars = ax.barh(y + offset, breakdown[name].to_numpy(float),
+                       height=height * 0.9, label=name)
+        ax.bar_label(bars, fmt="%.2f", fontsize=8, padding=2)
+
+    if "score" in rows:
+        ax.axhline(rows.index("score") - 0.5, color="0.5", lw=0.8)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.18)
+    xlabel = "공통 시나리오 평균 점수"
+    if has_multiplicative:
+        xlabel += "  (× = 곱셈 항)"
+    ax.set_xlabel(xlabel)
+    ax.axvline(1.0, color="0.7", lw=0.8, ls="--")
+    ax.grid(axis="x", alpha=0.3)
+    ax.legend(loc="lower right", fontsize=9)
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    return fig, ax
 
 
 # ---------------------------------------------------------------------------
