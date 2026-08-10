@@ -579,6 +579,396 @@ def scenario_video_browser(run_dir: Path, tag: str,
 
 
 # ---------------------------------------------------------------------------
+# PLUTO — 후보 궤적과 학습 점수
+# ---------------------------------------------------------------------------
+
+
+def capture_pluto_candidates(adapter, planner_input, initialization, top_k: int = 10):
+    """PLUTO 가 한 번의 forward 로 내놓는 **후보 궤적과 점수**를 상위 top_k 개만 꺼낸다.
+
+    어댑터는 `out["output_trajectory"]` 하나만 꺼내고 후보와 점수는 버린다
+    (`pluto_adapter.py` 의 `build_and_forward`). 후보를 보려면 모델 forward 를 직접 부른다 —
+    Diffusion 과 달리 monkey-patch 는 필요 없다. 이미 반환 dict 에 들어 있다.
+
+    `probability` 는 **reference line 이 패딩된 자리를 `-1e6` 으로 채워** 둔다
+    (`pluto_model.py` 의 `masked_fill_`). 거르지 않으면 유효한 후보들이 색 하나로 뭉갠다.
+
+    :return: `(candidates, scores, data)` — 점수 내림차순. `candidates` 는 `(K, 80, 3)`
+             `[x, y, yaw]` ego-local 이고 `candidates[0]` 이 곧 `AdapterOutput.ml_local` 이다.
+             `data` 는 지도를 그릴 때 쓰는 모델 입력 dict 다.
+    """
+    import torch
+
+    feature = adapter._feature_builder.get_features_from_simulation(
+        planner_input, initialization)
+    data = feature.collate([feature.to_feature_tensor()]).to_device(adapter._device).data
+    with torch.no_grad():
+        out = adapter._planner.forward(data)
+
+    candidates = out["candidate_trajectories"][0]        # (R, M, T, 3)
+    scores = out["probability"][0]                       # (R, M)
+    if candidates.numel() == 0:
+        raise RuntimeError(
+            "후보가 없습니다 — reference line 이 만들어지지 않았습니다. "
+            "build_reference_line=True 인지 확인하십시오.")
+
+    flat_traj = candidates.reshape(-1, candidates.shape[-2], candidates.shape[-1])
+    flat_score = scores.reshape(-1)
+    keep = flat_score > -1e5                             # 패딩 자리를 뗀다
+    flat_traj, flat_score = flat_traj[keep], flat_score[keep]
+
+    order = torch.argsort(flat_score, descending=True)[:top_k]
+    return (flat_traj[order].cpu().numpy(), flat_score[order].cpu().numpy(), data)
+
+
+def _plot_pluto_map(ax, data, alpha: float = 1.0):
+    """PLUTO 피처의 지도를 배경으로 깐다. `point_position` 은
+    `[구간, {중심, 좌경계, 우경계}, 20, xy]` 구조다."""
+    import numpy as np
+
+    def numpy_of(value):
+        return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+    points = numpy_of(data["map"]["point_position"])[0]          # (M, 3, P, 2)
+    on_route = numpy_of(data["map"].get("polygon_on_route", np.zeros(len(points))))
+    on_route = on_route[0] if on_route.ndim > 1 else on_route
+
+    for idx, segment in enumerate(points):
+        routed = bool(on_route[idx]) if idx < len(on_route) else False
+        ax.plot(*segment[0].T, color=_SCENE_COLOURS["route" if routed else "lane"],
+                lw=1.6 if routed else 0.9, ls="-" if routed else (0, (4, 3)),
+                alpha=(0.9 if routed else 1.0) * alpha, zorder=1)
+        for boundary in segment[1:]:
+            ax.plot(*boundary.T, color=_SCENE_COLOURS["boundary"], lw=0.8, alpha=alpha,
+                    zorder=1)
+
+    ax.plot(*_rotated_box(0, 0, 0, 2.297, 5.176).T,
+            color=_SCENE_COLOURS["ego"], lw=2.0, alpha=alpha, zorder=5)
+    return ax
+
+
+def plot_pluto_candidates(candidates, scores, data=None, axes=None, figsize=(13, 4.6),
+                          cmap: str = "Blues", dt: float = 0.1):
+    """후보 궤적을 **학습 점수로 칠하고 점수 순으로 겹쳐** 그린다.
+
+    색과 zorder 가 같은 것(점수)을 나타내므로, 최우선 후보가 가장 진하면서 맨 위에 온다.
+    점수는 순서가 있는 양이라 한 색상의 밝기 단계만 쓰고 색막대를 붙인다.
+
+    패널이 둘인 이유 — 후보는 `Q_lat × Q_lon` 격자라 **횡방향으로도 종방향으로도** 갈리는데,
+    조감도는 앞의 것만 보여 준다. 직진 장면에서는 후보가 전부 같은 차선 위에 겹쳐 한 줄로
+    보이며, 실제 차이는 "얼마나 멀리 가는가"에 있다. 오른쪽 패널이 그것을 편다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=figsize,
+                               gridspec_kw={"width_ratios": [1.55, 1]})
+    ax_map, ax_lon = axes
+    if data is not None:
+        _plot_pluto_map(ax_map, data)
+
+    lo, hi = float(np.min(scores)), float(np.max(scores))
+    norm = Normalize(lo, hi if hi > lo else lo + 1e-6)
+    colours = plt.get_cmap(cmap)(np.linspace(0.28, 1.0, len(scores)))
+
+    travel = np.concatenate(
+        [np.zeros((len(candidates), 1)),
+         np.cumsum(np.linalg.norm(np.diff(candidates[:, :, :2], axis=1), axis=-1), axis=1)],
+        axis=1)
+    t = np.arange(candidates.shape[1]) * dt
+
+    # 점수가 낮은 것부터 그려 높은 것이 위로 오게 한다.
+    for rank in range(len(candidates) - 1, -1, -1):
+        colour = colours[len(scores) - 1 - rank]
+        width = 2.8 if rank == 0 else 1.4
+        order = 10 + (len(scores) - rank)
+        ax_map.plot(candidates[rank][:, 0], candidates[rank][:, 1], color=colour,
+                    lw=width, zorder=order, solid_capstyle="round")
+        ax_lon.plot(t, travel[rank], color=colour, lw=width, zorder=order)
+
+    ax_map.annotate(f"1위 = ml_local  (점수 {scores[0]:.2f})", candidates[0][-1, :2],
+                    fontsize=9, fontweight="bold", xytext=(-6, 8), ha="right",
+                    textcoords="offset points", color=colours[-1], zorder=30)
+    ax_lon.annotate(f"1위  {travel[0][-1]:.0f} m", (t[-1], travel[0][-1]),
+                    fontsize=9, fontweight="bold", xytext=(-4, 6),
+                    textcoords="offset points", ha="right", color=colours[-1], zorder=30)
+
+    # 지도는 반경 120 m 라 그대로 두면 후보가 화면 한가운데 뭉갠다. 후보 범위로 맞춘다.
+    points = candidates[:, :, :2].reshape(-1, 2)
+    margin = 12.0
+    ax_map.set_xlim(points[:, 0].min() - margin, points[:, 0].max() + margin)
+    ax_map.set_ylim(points[:, 1].min() - margin, points[:, 1].max() + margin)
+    ax_map.set_aspect("equal")
+    ax_map.set_xlabel("x [m]  (자차 진행 방향)")
+    ax_map.set_ylabel("y [m]")
+    ax_map.set_title("경로 — 횡방향 후보", fontsize=10)
+    ax_map.grid(alpha=0.15)
+
+    ax_lon.set_xlabel("t [s]")
+    ax_lon.set_ylabel("주행 거리 [m]")
+    ax_lon.set_title("진행 거리 — 종방향 후보", fontsize=10)
+    ax_lon.grid(alpha=0.25)
+
+    bar = ax_lon.figure.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax_lon,
+                                 fraction=0.04, pad=0.02)
+    bar.set_label("학습 점수 (logit)")
+    ax_lon.figure.tight_layout()
+    return axes
+
+
+# ---------------------------------------------------------------------------
+# Diffusion — 입력 씬과 denoising 과정
+# ---------------------------------------------------------------------------
+
+
+def diffusion_scene_inputs(adapter, planner_input) -> Dict[str, "np.ndarray"]:
+    """Diffusion 이 **실제로 보는** 입력을 정규화 전 상태로 꺼낸다.
+
+    `DiffusionModelAdapter.build_and_forward` 는 이 dict 를 만든 직후
+    `observation_normalizer` 를 통과시키므로, 모델에 들어가는 값은 무차원이다.
+    그림으로 확인하려면 정규화 전 값이 필요해서 같은 호출을 한 번 더 한다.
+
+    :return: {키: (배치 차원 제거된) numpy}. 좌표는 **ego rear-axle 기준 미터**이며,
+             `AdapterOutput.ml_local` 및 denoising 중간 궤적과 같은 좌표계다.
+
+    채널 배치는 실제 텐서로 확인한 것이다.
+
+        neighbor_agents_past  (32, 21, 11)  [x, y, cos, sin, vx, vy, 폭, 길이, onehot(차·보행자·자전거)]
+        static_objects        (5, 10)       [x, y, cos, sin, 폭, 길이, onehot(4종)]
+        lanes                 (70, 20, 12)  [x, y, dx, dy, 좌경계offset(2), 우경계offset(2), 신호onehot(4)]
+        route_lanes           (25, 20, 12)  lanes 와 같은 채널, 주행 경로에 속한 것만
+
+    유효/패딩 마스크는 따로 없다 — **전 채널이 0 인 행이 패딩**이며 모델도 같은 규칙을 쓴다.
+    """
+    inputs = adapter._data_processor.observation_adapter(
+        planner_input.history,
+        list(planner_input.traffic_light_data),
+        adapter._map_api,
+        adapter._route_roadblock_ids,
+        adapter._device_str,
+    )
+    return {k: v.detach().cpu().numpy()[0] for k, v in inputs.items()}
+
+
+def capture_denoising_steps(adapter, planner_input, initialization, seed: Optional[int] = 0):
+    """denoising 매 단계의 중간 궤적을 모은다.
+
+    Diffusion 은 잡음에서 시작해 여러 단계를 거쳐 궤적을 복원한다. 그 중간값은 평소
+    밖으로 나오지 않지만, 샘플러가 이미 돌려줄 수 있게 되어 있다 —
+    `DPM_Solver.sample(..., return_intermediate=True)` 가 단계마다 `x_t` 를 모아 준다.
+    `dpm_sampler` 는 그 인자를 `sample_params` 로 그대로 통과시키는데, 호출부인
+    `decoder.py` 가 넘기지 않을 뿐이다.
+
+    그래서 **모델 코드를 고치지 않고** `decoder` 모듈에 바인딩된 `dpm_sampler` 이름만
+    잠시 감싼다(`from ... import dpm_sampler` 로 모듈 전역에 붙어 있어 속성 교체가 먹는다).
+    감싼 함수는 반드시 `x0` **하나만** 돌려줘야 한다 — 호출부가 튜플을 받을 준비가 없다.
+
+    :param seed: `DIFFUSION_EVAL_SEED`. 초기 잡음이 고정되어 다시 돌려도 같은 그림이 나온다.
+                 None 이면 건드리지 않는다.
+    :return: `(steps, out)`. `steps` 는 `(K, 80, 3)` = `[x, y, yaw]` ego-local numpy 이고
+             마지막 원소가 `out.ml_local` 과 같다.
+    """
+    import numpy as np
+    import torch
+
+    import diffusion_planner.model.module.decoder as decoder_module
+
+    original = decoder_module.dpm_sampler
+    captured: List["torch.Tensor"] = []
+
+    def capturing_sampler(model, x_T, **kwargs):
+        kwargs["sample_params"] = {**kwargs.get("sample_params", {}),
+                                   "return_intermediate": True}
+        x0, intermediates = original(model, x_T, **kwargs)
+        # correcting_xt_fn(initial_state_constraint) 이 xt 를 in-place 로 고친다.
+        # 복사하지 않으면 뒤 단계가 앞 단계 텐서를 덮어쓴다.
+        captured.extend(t.detach().clone() for t in intermediates)
+        return x0
+
+    previous = os.environ.get("DIFFUSION_EVAL_SEED")
+    decoder_module.dpm_sampler = capturing_sampler
+    if seed is not None:
+        os.environ["DIFFUSION_EVAL_SEED"] = str(seed)
+    try:
+        out = adapter.build_and_forward(planner_input, initialization)
+    finally:
+        decoder_module.dpm_sampler = original
+        if seed is not None:
+            if previous is None:
+                os.environ.pop("DIFFUSION_EVAL_SEED", None)
+            else:
+                os.environ["DIFFUSION_EVAL_SEED"] = previous
+
+    if not captured:
+        raise RuntimeError(
+            "중간값을 하나도 잡지 못했습니다 — 어댑터가 Diffusion 이 맞는지 확인하십시오.")
+
+    # 모델이 내놓는 것은 정규화된 값이다. decoder 가 마지막에 하는 것과 똑같이 되돌린다.
+    normalizer = adapter._config.state_normalizer
+    steps = []
+    for x_t in captured:
+        batch, agents = x_t.shape[0], x_t.shape[1]
+        denorm = normalizer.inverse(x_t.reshape(batch, agents, -1, 4))
+        ego = denorm[0, 0, 1:]                      # 0번 칸은 현재 상태 앵커라 뗀다
+        yaw = torch.atan2(ego[:, 3], ego[:, 2])
+        steps.append(torch.stack([ego[:, 0], ego[:, 1], yaw], dim=-1).cpu().numpy())
+    return np.stack(steps), out
+
+
+#: 씬 배경은 궤적을 읽는 데 방해가 되면 안 된다. 전부 무채색으로 뒤로 물린다.
+_SCENE_COLOURS = dict(lane="0.82", boundary="0.90", route="0.55",
+                      agent="0.62", static="0.72", ego="#d95f02")
+
+
+def _rotated_box(x, y, yaw, width, length):
+    """중심·헤딩·크기로 사각형 네 꼭짓점을 만든다 (닫힌 5점)."""
+    import numpy as np
+
+    half = np.array([[length / 2, width / 2], [length / 2, -width / 2],
+                     [-length / 2, -width / 2], [-length / 2, width / 2],
+                     [length / 2, width / 2]])
+    rot = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+    return half @ rot.T + np.array([x, y])
+
+
+def plot_diffusion_scene(scene, ax=None, figsize=(11, 6), show_boundary: bool = True,
+                         alpha: float = 1.0, labels: bool = True):
+    """Diffusion 입력 네 갈래를 ego-local 좌표에 그린다.
+
+    노트북 4 절 머리말 그림의 *Scenario Inputs* 네 갈래와 1:1 로 대응한다 —
+    Lanes · Navigation(route) · Neighbors · Static Obj. 궤적을 겹쳐 그릴 배경이므로
+    전부 무채색으로 뒤로 물리고, 자차만 색을 준다.
+
+    :param alpha: 배경으로 깔 때 더 흐리게 하려면 낮춘다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    for lane in scene["lanes"]:
+        pts = lane[np.abs(lane[:, :2]).sum(-1) > 0]      # 0 패딩 제거
+        if len(pts) < 2:
+            continue
+        if show_boundary:
+            ax.plot(*(pts[:, :2] + pts[:, 4:6]).T, color=_SCENE_COLOURS["boundary"],
+                    lw=0.8, alpha=alpha)
+            ax.plot(*(pts[:, :2] + pts[:, 6:8]).T, color=_SCENE_COLOURS["boundary"],
+                    lw=0.8, alpha=alpha)
+        ax.plot(*pts[:, :2].T, color=_SCENE_COLOURS["lane"], lw=0.9,
+                ls=(0, (4, 3)), alpha=alpha)
+
+    for lane in scene["route_lanes"]:
+        pts = lane[np.abs(lane[:, :2]).sum(-1) > 0]
+        if len(pts) >= 2:
+            ax.plot(*pts[:, :2].T, color=_SCENE_COLOURS["route"], lw=2.2, alpha=0.9 * alpha)
+
+    agents = scene["neighbor_agents_past"][:, -1, :]      # 현재 프레임만
+    for a in agents[np.abs(agents[:, :4]).sum(-1) > 0]:
+        box = _rotated_box(a[0], a[1], np.arctan2(a[3], a[2]), a[6], a[7])
+        ax.plot(*box.T, color=_SCENE_COLOURS["agent"], lw=1.1, alpha=alpha)
+
+    static = scene["static_objects"]
+    for s in static[np.abs(static[:, :4]).sum(-1) > 0]:
+        box = _rotated_box(s[0], s[1], np.arctan2(s[3], s[2]), s[4], s[5])
+        ax.fill(*box.T, color=_SCENE_COLOURS["static"], lw=0, alpha=alpha)
+
+    ax.plot(*_rotated_box(0, 0, 0, 2.297, 5.176).T,
+            color=_SCENE_COLOURS["ego"], lw=2.0, alpha=alpha, zorder=5)
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.15 * alpha)
+    if labels:
+        ax.set_xlabel("x [m]  (자차 진행 방향)")
+        ax.set_ylabel("y [m]")
+    return ax
+
+
+def plot_denoising_steps(steps, scene=None, ncols: int = 4, panel: float = 3.0,
+                         cmap: str = "Blues"):
+    """denoising 단계별 중간 궤적을 **단계마다 한 칸씩** 그린다.
+
+    12 개를 한 축에 겹치면 초반 잡음이 화면을 덮어 아무것도 읽히지 않는다. 칸을 나누면
+    "잡음이 접혀 들어가 궤적이 된다" 는 과정이 순서대로 보인다. 모든 칸이 같은 축 범위를
+    쓰므로 칸끼리 크기를 그대로 비교할 수 있다.
+
+    색은 단계 **순서**를 나타내는 양이라 한 색상의 밝기 단계(연함 → 진함)만 쓴다.
+    순서를 읽는 것은 칸 제목이므로 색에만 기대지 않는다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n = len(steps)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(panel * ncols, panel * nrows * 0.78),
+                             squeeze=False)
+    shades = plt.get_cmap(cmap)(np.linspace(0.35, 1.0, n))
+
+    pts = steps[:, :, :2].reshape(-1, 2)
+    pad = 8.0
+    xlim = (pts[:, 0].min() - pad, pts[:, 0].max() + pad)
+    ylim = (pts[:, 1].min() - pad, pts[:, 1].max() + pad)
+
+    for k in range(nrows * ncols):
+        ax = axes[k // ncols][k % ncols]
+        if k >= n:
+            ax.axis("off")
+            continue
+        if scene is not None:
+            plot_diffusion_scene(scene, ax=ax, show_boundary=False,
+                                 alpha=0.55, labels=False)
+        ax.plot(steps[k][:, 0], steps[k][:, 1], color=shades[k],
+                lw=2.4 if k == n - 1 else 1.6, solid_capstyle="round", zorder=10)
+        note = "  ← 잡음" if k == 0 else ("  ← ml_local" if k == n - 1 else "")
+        ax.set_title(f"step {k}{note}", fontsize=9,
+                     fontweight="bold" if k in (0, n - 1) else "normal")
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_denoising_convergence(steps, axes=None, figsize=(11, 3.6)):
+    """단계가 진행되며 궤적이 어떻게 정리되는지 두 값으로 본다.
+
+    두 값은 단위와 크기가 달라 한 축에 겹치지 않고 패널을 나눈다.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.ticker import FuncFormatter
+
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=figsize)
+
+    length = np.linalg.norm(np.diff(steps[:, :, :2], axis=1), axis=-1).sum(-1)
+    shift = np.r_[np.nan, np.linalg.norm(np.diff(steps[:, :, :2], axis=0),
+                                         axis=-1).mean(-1)]
+    k = np.arange(len(steps))
+
+    for ax, value, title, unit in (
+            (axes[0], length, "궤적의 경로 길이", "m"),
+            (axes[1], shift, "직전 단계 대비 평균 이동량", "m")):
+        ax.plot(k, value, color="#1f6fb4", lw=2.0, marker="o", ms=4)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("denoising 단계")
+        ax.set_ylabel(f"[{unit}]")
+        ax.grid(alpha=0.25)
+
+    # 로그축의 기본 눈금 라벨은 mathtext(10^{-1})라 유니코드 마이너스를 쓴다. 한글 폰트에는
+    # 그 글리프가 없어 네모로 나오므로, 평범한 숫자로 찍는다.
+    axes[1].set_yscale("log")
+    axes[1].yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    axes[1].yaxis.set_minor_formatter(FuncFormatter(lambda v, _: ""))
+    return axes
+
+
+# ---------------------------------------------------------------------------
 # 모델 간 비교 — 같은 시나리오에서 두 런을 나란히 놓는다
 # ---------------------------------------------------------------------------
 
