@@ -362,6 +362,115 @@ CLOSED_BREAKDOWN = [
 ]
 
 
+class RealtimeNuPlanMetricTracker:
+    """실제 Closed-loop history에 같은 nuPlan metric을 매 step 적용한다.
+
+    ``update``는 두 dict를 반환한다.
+
+    - ``step``: 이번 planning timestep에서 계산된 값
+    - ``cumulative``: 현재까지 실행된 history prefix의 metric 값
+
+    노트북은 계산 순서와 시각화에 집중하고, 지표별 입력 window를 맞추는 반복 코드는
+    이 helper에 둔다. 공식 metric의 점수 함수와 threshold는 바꾸지 않는다.
+    """
+
+    def __init__(self, scenario):
+        self.scenario = scenario
+        self.ego_states = []
+        self.observations = []
+        self.expert_ego_states = []
+        self.baseline_path = None
+        self._cumulative_collision_score = 1.0
+
+    @staticmethod
+    def _metric_functions():
+        from src.planners.evaluator.evaluate_functions import (
+            score_drivable_area_compliance,
+            score_driving_direction_compliance,
+            score_ego_is_comfortable,
+            score_ego_progress,
+            score_no_ego_at_fault_collisions,
+            score_speed_limit_compliance,
+            score_time_to_collision,
+        )
+        return {
+            "collision": score_no_ego_at_fault_collisions,
+            "drivable": score_drivable_area_compliance,
+            "direction": score_driving_direction_compliance,
+            "ttc": score_time_to_collision,
+            "speed": score_speed_limit_compliance,
+            "comfort": score_ego_is_comfortable,
+            "progress": score_ego_progress,
+        }
+
+    def _values(self, *, current_step: bool):
+        fn = self._metric_functions()
+        dt = float(self.scenario.database_interval)
+
+        if current_step:
+            current_states = self.ego_states[-1:]
+            current_observations = self.observations[-1:]
+            direction_window = max(2, int(round(1.0 / dt)) + 1)
+            direction_states = self.ego_states[-direction_window:]
+            comfort_window = max(5, int(round(1.5 / dt)) + 1)
+            comfort_states = self.ego_states[-comfort_window:]
+        else:
+            current_states = self.ego_states
+            current_observations = self.observations
+            direction_states = self.ego_states
+            comfort_states = self.ego_states
+
+        collision, _ = fn["collision"](
+            self.scenario, current_states, current_observations)
+        drivable, _ = fn["drivable"](self.scenario, current_states)
+        direction, _ = fn["direction"](self.scenario, direction_states)
+        ttc, _ = fn["ttc"](self.scenario, current_states, current_observations)
+        speed, _ = fn["speed"](self.scenario, current_states)
+
+        comfort = 1.0
+        if len(comfort_states) >= 5:
+            comfort, _ = fn["comfort"](comfort_states, dt=dt)
+
+        # progress는 nuPlan 정의상 pose 하나의 값이 아니라 시작~현재 history의 진행량이다.
+        progress, making_progress, _ = fn["progress"](
+            self.ego_states, self.expert_ego_states, self.baseline_path)
+
+        return {
+            "no_ego_at_fault_collisions": float(collision),
+            "drivable_area_compliance": float(drivable),
+            "driving_direction_compliance": float(direction),
+            "ego_is_making_progress": float(making_progress),
+            "ego_progress_along_expert_route": float(progress),
+            "time_to_collision_within_bound": float(ttc),
+            "speed_limit_compliance": float(speed),
+            "ego_is_comfortable": float(comfort),
+        }
+
+    def update(self, ego_state, observation, expert_ego_state, baseline_path=None):
+        """실제 상태 하나를 추가하고 ``(step, cumulative)``을 반환한다."""
+        self.ego_states.append(ego_state)
+        self.observations.append(observation)
+        self.expert_ego_states.append(expert_ego_state)
+        if self.baseline_path is None and baseline_path is not None:
+            self.baseline_path = baseline_path
+        step = self._values(current_step=True)
+        cumulative = self._values(current_step=False)
+
+        # Collision은 최초 접촉과 과실 분류를 기억하는 이벤트 지표다. 단일 snapshot의
+        # overlap을 매번 새 충돌로 보지 않고, prefix gate가 처음 1→0이 된 step만 표시한다.
+        collision_name = "no_ego_at_fault_collisions"
+        cumulative_collision = min(
+            self._cumulative_collision_score,
+            float(cumulative[collision_name]),
+        )
+        step[collision_name] = float(
+            not (self._cumulative_collision_score > 0.0 and cumulative_collision == 0.0)
+        )
+        cumulative[collision_name] = cumulative_collision
+        self._cumulative_collision_score = cumulative_collision
+        return step, cumulative
+
+
 def load_aggregate(run_dir: Path):
     """런 디렉토리에서 가장 최근 집계 parquet 을 읽는다."""
     import pandas as pd
@@ -467,14 +576,341 @@ def verify_open_loop(run_dir: Path):
 
 
 def load_step_csv(run_dir: Path):
-    """planner 가 매 스텝 남긴 채점 CSV 를 모두 합친다 (워커 PID 마다 한 파일)."""
+    """planner 가 매 스텝 남긴 PID별 CSV를 합쳐 한 실행 timeline으로 만든다.
+
+    같은 uid로 중단 후 재실행한 폴더에는 예전 PID CSV가 남아 같은
+    ``(log_name, token, iteration)``이 중복될 수 있다. 시나리오별로 iteration이
+    가장 많이 기록된 CSV 하나를 선택하고, 길이가 같으면 수정 시각이 최신인 파일을
+    선택한다. 중복 행을 그대로 그리면 한 모델의 시간축이 앞뒤로 되감겨 다른
+    모델과 비교할 수 없다.
+    """
     import pandas as pd
 
     files = sorted(Path(run_dir).rglob("trajectory_evaluator_results/*.csv"))
-    frames = [pd.read_csv(f) for f in files if f.stat().st_size > 0]
+    frames = []
+    for path in files:
+        if path.stat().st_size == 0:
+            continue
+        frame = pd.read_csv(path)
+        frame["_csv_source"] = str(path)
+        frame["_csv_mtime_ns"] = path.stat().st_mtime_ns
+        frames.append(frame)
     if not frames:
         return None
-    return pd.concat(frames, ignore_index=True)
+
+    result = pd.concat(frames, ignore_index=True)
+    identity = [
+        column for column in ("log_name", "token", "iteration")
+        if column in result.columns
+    ]
+    if len(identity) == 3:
+        scenario_key = ["log_name", "token"]
+        source_rank = (
+            result.groupby([*scenario_key, "_csv_source"], as_index=False)
+            .agg(
+                _iteration_count=("iteration", "nunique"),
+                _source_mtime_ns=("_csv_mtime_ns", "max"),
+            )
+            .sort_values(["_iteration_count", "_source_mtime_ns"])
+            .drop_duplicates(scenario_key, keep="last")
+        )
+        chosen_sources = source_rank[[*scenario_key, "_csv_source"]]
+        result = (
+            result.merge(
+                chosen_sources,
+                on=[*scenario_key, "_csv_source"],
+                how="inner",
+                validate="many_to_one",
+            )
+            .sort_values("_csv_mtime_ns")
+            .drop_duplicates(identity, keep="last")
+            .sort_values(["token", "iteration"])
+            .reset_index(drop=True)
+        )
+    return result.drop(columns=["_csv_source", "_csv_mtime_ns"])
+
+
+def load_executed_metric_runs(
+    model_runs: Mapping[str, Path],
+    expected_adapters: Mapping[str, str],
+    metrics: Optional[Sequence[str]] = None,
+):
+    """Chapter 10의 executed-history CSV와 official 표를 model·token으로 맞춘다."""
+    import numpy as np
+    import pandas as pd
+    from omegaconf import OmegaConf
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    step_columns = [f"step_{name}" for name in metric_names]
+    cumulative_columns = [f"cumulative_{name}" for name in metric_names]
+    required = ["step_final", "cumulative_final", *step_columns, *cumulative_columns]
+    official_tables = {
+        model: per_scenario_scores(run_dir, columns=metric_names).set_index("token")
+        for model, run_dir in model_runs.items()
+    }
+
+    step_runs = {}
+    for model, run_dir in model_runs.items():
+        cfg = OmegaConf.load(Path(run_dir) / "code/hydra/config.yaml")
+        adapter = str(cfg.planner.refinement_planner.model_adapter._target_)
+        expected = expected_adapters[model]
+        if not adapter.endswith(expected):
+            raise AssertionError(f"{model} adapter가 아닙니다: {adapter}")
+
+        frame = load_step_csv(run_dir)
+        if frame is None:
+            raise FileNotFoundError(f"{model} timestep CSV가 없습니다.")
+        missing = [column for column in required if column not in frame]
+        if missing:
+            raise KeyError(
+                f"{model} 결과는 이전 CSV 스키마입니다. 10.1을 다시 실행하십시오. "
+                f"누락 열 예: {missing[:3]}"
+            )
+        empty = [column for column in required if frame[column].isna().all()]
+        if empty:
+            raise ValueError(
+                f"{model} executed-history 계산이 실패했습니다. 빈 열: {empty[:3]}"
+            )
+
+        frame = frame.drop_duplicates(
+            ["log_name", "token", "iteration"], keep="last"
+        ).copy()
+        frame.insert(0, "model", model)
+        official = official_tables[model]
+        unknown = sorted(set(frame["token"]) - set(official.index))
+        if unknown:
+            raise KeyError(f"공식 결과가 없는 token: {unknown}")
+        frame["official_final"] = frame["token"].map(official["score"])
+        frame["official_collision"] = frame["token"].map(
+            official["no_ego_at_fault_collisions"]
+        )
+        # v2 CSV의 step collision은 매 snapshot에서 collision history를 초기화해
+        # 지속 overlap을 새 충돌로 오인할 수 있었다. 두 모델 모두 official과 같은
+        # history-prefix 판정을 기준으로 삼고, 최초 1→0 전환만 step event로 복원한다.
+        original_step_collision = frame["step_no_ego_at_fault_collisions"].copy()
+        corrected_groups = []
+        for _, group in frame.groupby(["log_name", "token"], sort=False):
+            group = group.sort_values("iteration").copy()
+            cumulative_name = "cumulative_no_ego_at_fault_collisions"
+            cumulative_collision = group[cumulative_name].astype(float).cummin()
+            previous_collision = cumulative_collision.shift(fill_value=1.0)
+            new_at_fault_event = (previous_collision > 0.0) & (cumulative_collision <= 0.0)
+            group[cumulative_name] = cumulative_collision
+            group["step_no_ego_at_fault_collisions"] = np.where(
+                new_at_fault_event, 0.0, 1.0
+            )
+            corrected_groups.append(group)
+        frame = pd.concat(corrected_groups, ignore_index=True)
+
+        # collision gate가 바뀐 만큼 step final도 같은 곱셈·가중평균 식으로 다시 계산한다.
+        total_weight = float(sum(CLOSED_WEIGHTS.values()))
+        frame["step_final"] = frame.apply(
+            lambda row: float(np.prod([
+                row[f"step_{name}"] for name in CLOSED_MULTIPLICATIVE
+            ])) * float(sum(
+                weight * row[f"step_{name}"]
+                for name, weight in CLOSED_WEIGHTS.items()
+            )) / total_weight,
+            axis=1,
+        )
+        corrected_count = int(np.sum(~np.isclose(
+            original_step_collision.to_numpy(dtype=float),
+            frame["step_no_ego_at_fault_collisions"].to_numpy(dtype=float),
+        )))
+        if corrected_count:
+            print(f"{model:9s} | legacy step collision {corrected_count}개 자동 보정")
+        invalid = np.isclose(frame["official_collision"], 0.0) & ~np.isclose(
+            frame["official_final"], 0.0
+        )
+        if invalid.any():
+            raise AssertionError(
+                "ego-at-fault collision=0인데 official final이 0이 아닙니다."
+            )
+
+        step_runs[model] = frame
+        print(
+            f"{model:9s} | {adapter.rsplit('.', 1)[-1]:21s} | "
+            f"{frame['token'].nunique()} scenarios, {len(frame)} executed timesteps"
+        )
+    return step_runs, official_tables
+
+
+def summarize_executed_metric_runs(
+    step_runs: Mapping[str, object],
+    metrics: Optional[Sequence[str]] = None,
+    dt_s: float = 0.1,
+):
+    """모델·시나리오별 대표 저하 시점과 공통 비교 token을 고른다."""
+    import pandas as pd
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    gate_names = list(CLOSED_MULTIPLICATIVE)
+    alert_rows = []
+    for model, frame in step_runs.items():
+        for token, group in frame.groupby("token"):
+            rows = (
+                group.sort_values("iteration")
+                .drop_duplicates("iteration", keep="last")
+                .reset_index(drop=True)
+            )
+            first_iteration = int(rows["iteration"].iloc[0])
+            failed_gate = rows[
+                [f"cumulative_{name}" for name in gate_names]
+            ].lt(1.0 - 1e-9).any(axis=1)
+            if failed_gate.any():
+                row = rows.loc[failed_gate].iloc[0]
+                selection = "first executed-history gate failure"
+            else:
+                drops = rows["cumulative_final"].diff()
+                if drops.notna().any() and float(drops.min()) < -1e-9:
+                    row = rows.loc[drops.idxmin()]
+                    selection = f"largest cumulative drop ({float(drops.min()):.3f})"
+                else:
+                    row = rows.loc[rows["cumulative_final"].idxmin()]
+                    selection = "minimum cumulative score"
+
+            step_degraded = [
+                name for name in metric_names
+                if float(row[f"step_{name}"]) < 1.0 - 1e-9
+            ]
+            cumulative_degraded = [
+                name for name in metric_names
+                if float(row[f"cumulative_{name}"]) < 1.0 - 1e-9
+            ]
+            alert_rows.append({
+                "model": model,
+                "token": token,
+                "iteration": int(row["iteration"]),
+                "time_s": (int(row["iteration"]) - first_iteration) * dt_s,
+                "online_cumulative": float(row["cumulative_final"]),
+                "official_collision": float(row["official_collision"]),
+                "official_final": float(row["official_final"]),
+                "selection": selection,
+                "step_degraded": " | ".join(step_degraded),
+                "cumulative_degraded": " | ".join(cumulative_degraded),
+            })
+
+    alerts = pd.DataFrame(alert_rows).sort_values(
+        ["official_final", "time_s", "model"]
+    ).reset_index(drop=True)
+    common_tokens = sorted(set.intersection(
+        *[set(frame["token"]) for frame in step_runs.values()]
+    ))
+    if not common_tokens:
+        raise ValueError("두 모델의 CSV에 공통 token이 없습니다.")
+    token_rank = (
+        alerts[alerts["token"].isin(common_tokens)]
+        .groupby("token")["official_final"].min().sort_values()
+    )
+    return alerts, common_tokens, str(token_rank.index[0])
+
+
+def plot_executed_metric_timeline(
+    rows,
+    title: str,
+    metrics: Optional[Sequence[str]] = None,
+    dt_s: float = 0.1,
+):
+    """누적 final과 실제 step·prefix 지표를 같은 iteration 축에 그린다."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    step_columns = [f"step_{name}" for name in metric_names]
+    cumulative_columns = [f"cumulative_{name}" for name in metric_names]
+    rows = rows.sort_values("iteration").reset_index(drop=True)
+    iterations = rows["iteration"].to_numpy(dtype=float)
+    edges = np.concatenate([iterations, [iterations[-1] + 1]])
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(13, 9), sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 2.1, 2.1]},
+    )
+    axes[0].plot(iterations, rows["cumulative_final"], "o-", ms=3, lw=1.8,
+                 label="online cumulative final")
+    official_final = float(rows["official_final"].iloc[0])
+    axes[0].axhline(official_final, color="black", ls=":", alpha=.7,
+                    label=f"official scenario final = {official_final:.3f}")
+    axes[0].set(ylabel="score", ylim=(-0.05, 1.05),
+                title=f"{title} — actual executed-history metrics")
+    axes[0].grid(alpha=.3); axes[0].legend(loc="lower left", fontsize=8)
+
+    for axis, columns, panel_title in (
+        (axes[1], step_columns, "Per-timestep metrics (step_*)"),
+        (axes[2], cumulative_columns, "History-prefix metrics (cumulative_*)"),
+    ):
+        image = axis.pcolormesh(
+            edges, np.arange(len(columns) + 1),
+            rows[columns].to_numpy(dtype=float).T,
+            shading="flat", vmin=0, vmax=1, cmap="RdYlGn",
+        )
+        axis.set_ylim(len(columns), 0)
+        axis.set_yticks(np.arange(len(columns)) + .5)
+        axis.set_yticklabels(metric_names, fontsize=8)
+        axis.set_title(panel_title)
+        fig.colorbar(image, ax=axis, label="metric value", pad=.01)
+    axes[2].set_xlabel(f"simulation iteration  (1 step = {dt_s:g} s)")
+    fig.tight_layout()
+    return fig
+
+
+def show_executed_metric_analysis(
+    step_runs: Mapping[str, object],
+    alerts,
+    token: str,
+    metrics: Optional[Sequence[str]] = None,
+    dt_s: float = 0.1,
+) -> None:
+    """대표 시점 전후 표와 전체 executed-history timeline을 모델별로 출력한다."""
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+    metric_names = list(metrics or CLOSED_BREAKDOWN)
+    for model, frame in step_runs.items():
+        selected = frame[frame["token"] == token].sort_values("iteration").copy()
+        selected["time_s"] = (
+            selected["iteration"] - selected["iteration"].iloc[0]
+        ) * dt_s
+        alert = alerts[
+            (alerts["model"] == model) & (alerts["token"] == token)
+        ].iloc[0]
+        center = int(alert["iteration"])
+        window = selected[selected["iteration"].between(center - 3, center + 3)]
+        degraded = {
+            name
+            for column in ("step_degraded", "cumulative_degraded")
+            for name in str(alert[column]).split(" | ")
+            if name
+        }
+        detail_names = [name for name in metric_names if name in degraded]
+        detail_columns = [
+            column
+            for name in detail_names
+            for column in (f"step_{name}", f"cumulative_{name}")
+        ]
+        show_columns = [
+            "model", "token", "iteration", "time_s", "step_final",
+            "cumulative_final", "official_collision", "official_final",
+            *detail_columns,
+        ]
+
+        section(
+            f"{model} | {alert['selection']} | "
+            f"iter={center}, t={alert['time_s']:.1f}s"
+        )
+        print("현재 timestep 저하:", alert["step_degraded"] or "없음")
+        print("누적 history 저하:", alert["cumulative_degraded"] or "없음")
+        print(
+            f"official collision={alert['official_collision']:.3f} | "
+            f"official final={alert['official_final']:.3f}"
+        )
+        display(window[show_columns].round(3))
+        fig = plot_executed_metric_timeline(
+            selected, f"{model} — {token[:8]}", metric_names, dt_s
+        )
+        for axis in fig.axes[:3]:
+            axis.axvline(center, color="red", ls="--", alpha=.7)
+        plt.show()
 
 
 def runner_status(run_dir: Path):
@@ -1055,15 +1491,16 @@ def plot_breakdown_comparison(breakdown, title: Optional[str] = None,
                               figsize=(10, 5.5)):
     """`compare_breakdown()` 표를 가로 막대그래프로 그린다.
 
-    지표 이름이 길어 가로로 눕힌다. 곱셈 항(하나라도 0 이면 총점이 0)은 이름 앞에
-    `×` 를 붙여 가중합 항과 구분하고, 총점 행은 구분선 아래로 뗀다 — 같은 축에
-    나란히 두면 총점이 지표 하나처럼 보인다.
+    지표 이름이 길어 가로로 눕힌다. Closed-loop 곱셈 항이 포함된 표에서는 이름 앞에
+    `×` 를 붙여 가중합 항과 구분한다. Open-loop 표에는 해당 표시를 붙이지 않는다.
+    총점 행은 구분선 아래로 뗀다 — 같은 축에 나란히 두면 총점이 지표 하나처럼 보인다.
     """
     import matplotlib.pyplot as plt
     import numpy as np
 
     names = [c for c in breakdown.columns if c != "차이"]
     rows = list(breakdown.index)
+    has_multiplicative = any(r in CLOSED_MULTIPLICATIVE for r in rows)
     labels = [("× " if r in CLOSED_MULTIPLICATIVE else "   ") + r for r in rows]
 
     y = np.arange(len(rows))
@@ -1083,7 +1520,10 @@ def plot_breakdown_comparison(breakdown, title: Optional[str] = None,
     ax.set_yticklabels(labels, fontsize=9)
     ax.invert_yaxis()
     ax.set_xlim(0, 1.18)
-    ax.set_xlabel("공통 시나리오 평균 점수  (× = 곱셈 항)")
+    xlabel = "공통 시나리오 평균 점수"
+    if has_multiplicative:
+        xlabel += "  (× = 곱셈 항)"
+    ax.set_xlabel(xlabel)
     ax.axvline(1.0, color="0.7", lw=0.8, ls="--")
     ax.grid(axis="x", alpha=0.3)
     ax.legend(loc="lower right", fontsize=9)
